@@ -1,11 +1,27 @@
 #!/usr/bin/env bash
 # ~/.claude/statusline.sh
-# Claude Code status line: model | dir | git branch | tokens | top-tool | cost
+# Claude Code diagnostic status line.
+#
+# Format:
+#   model | dir | branch | t:N | Xk tok(+Δ [!]pct%) | ⬆tool Xk/share% | $cost(+Δ[!])
+#
+# The line is intentionally dense: every field carries a signal you can
+# diagnose at a glance (or paste to another Claude and it can diagnose it
+# for you). See README § diagnostic reading for interpretation.
 #
 # Portable across Linux (Synology/WSL), macOS (bash 3.2, no GNU coreutils),
 # and plain Debian/Ubuntu. Hard dependencies: bash, jq, awk. Optional: git.
+#
+# Tunable thresholds (env vars):
+#   CLAUDE_ADVISE_CTX_PCT       context %age that gets flagged with '!'   (default 80)
+#   CLAUDE_ADVISE_COST_RATIO    (this turn Δcost / avg prior Δcost) to flag (default 2.5)
+#   CLAUDE_ADVISE_COST_FLOOR    minimum Δcost USD for spike flag          (default 0.10)
 
 input=$(cat)
+
+CLAUDE_ADVISE_CTX_PCT="${CLAUDE_ADVISE_CTX_PCT:-80}"
+CLAUDE_ADVISE_COST_RATIO="${CLAUDE_ADVISE_COST_RATIO:-2.5}"
+CLAUDE_ADVISE_COST_FLOOR="${CLAUDE_ADVISE_COST_FLOOR:-0.10}"
 
 # --- colors (dim palette, safe on most terminals) ---
 if [ -t 1 ] || [ -n "${COLORTERM:-}" ] || [ "${TERM:-dumb}" != "dumb" ]; then
@@ -82,6 +98,7 @@ _run_jq() {
 user_turns=0
 top_tool=""
 top_bytes=0
+total_tool_bytes=0
 if [ -n "$transcript" ] && [ -f "$transcript" ]; then
   user_turns=$(_run_jq -c '
     select(.type=="user"
@@ -90,6 +107,7 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
   ' "$transcript" 2>/dev/null | wc -l | tr -d '[:space:]')
   : "${user_turns:=0}"
 
+  # Emits three space-separated values: total_bytes top_name top_bytes
   top_line=$(_run_jq -sr '
     [.[] | .message.content? | select(type=="array") | .[]] as $all
     | ($all | map(select(.type=="tool_use") | {key:.id, value:.}) | from_entries) as $byid
@@ -102,17 +120,21 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
               | {name:$n, bytes:(.content|tostring|length)}))
       )
     | group_by(.name)
-    | map({name:.[0].name, bytes:(map(.bytes)|add)})
-    | sort_by(-.bytes)
-    | .[0] // empty
-    | "\(.name):\(.bytes)"
+    | map({name:.[0].name, bytes:(map(.bytes)|add)}) as $grouped
+    | ($grouped | map(.bytes) | add // 0) as $total
+    | ($grouped | sort_by(-.bytes) | .[0] // {name:"",bytes:0}) as $top
+    | "\($total) \($top.name) \($top.bytes)"
   ' "$transcript" 2>/dev/null)
   if [ -n "$top_line" ]; then
-    top_tool="${top_line%%:*}"
-    top_bytes="${top_line##*:}"
+    # shellcheck disable=SC2086
+    set -- $top_line
+    total_tool_bytes=${1:-0}
+    top_tool=${2:-}
+    top_bytes=${3:-0}
   fi
 fi
 : "${top_bytes:=0}"
+: "${total_tool_bytes:=0}"
 
 # --- per-turn delta: baseline snapshots at the start of each user turn ---
 session_id=$(jq_field '.session_id // empty')
@@ -122,6 +144,7 @@ mkdir -p "$state_dir" 2>/dev/null
 base_turns=""
 base_tok=""
 base_top_bytes=""
+base_cost=""
 if [ -n "$session_id" ]; then
   state_file="$state_dir/$session_id.state"
   if [ -r "$state_file" ]; then
@@ -130,6 +153,7 @@ if [ -n "$session_id" ]; then
         turns)     base_turns=$v ;;
         tok)       base_tok=$v ;;
         top_bytes) base_top_bytes=$v ;;
+        cost)      base_cost=$v ;;
       esac
     done < "$state_file"
   fi
@@ -140,9 +164,11 @@ if [ -n "$session_id" ]; then
       printf 'turns=%s\n' "$user_turns"
       printf 'tok=%s\n'   "$tok_raw"
       printf 'top_bytes=%s\n' "$top_bytes"
+      printf 'cost=%s\n'  "${cost_usd:-0}"
     } > "$state_file" 2>/dev/null
     base_tok=$tok_raw
     base_top_bytes=$top_bytes
+    base_cost=${cost_usd:-0}
   fi
 fi
 
@@ -152,6 +178,39 @@ delta_top_bytes=$(( top_bytes - ${base_top_bytes:-$top_bytes} ))
 [ "$delta_top_bytes" -lt 0 ] 2>/dev/null && delta_top_bytes=0
 delta_top=$(( delta_top_bytes / 4 ))
 
+# Cost delta & outlier detection (float math → awk).
+# delta_cost = current - base_cost (0 if missing)
+# avg_prior_cost_per_turn = base_cost / max(base_turns - 1, 1)
+# spike = (base_turns > 1) && (delta_cost > FLOOR) && (delta_cost > RATIO * avg)
+read -r delta_cost cost_spike <<EOF
+$(awk -v c="${cost_usd:-0}" -v b="${base_cost:-0}" \
+       -v bt="${base_turns:-0}" -v r="$CLAUDE_ADVISE_COST_RATIO" \
+       -v f="$CLAUDE_ADVISE_COST_FLOOR" 'BEGIN{
+  d = (c+0) - (b+0); if (d<0) d=0
+  spike = 0
+  if ((bt+0) > 1) {
+    prior_turns = (bt+0) - 1
+    avg = (b+0) / prior_turns
+    if (d > (f+0) && d > (r+0) * avg) spike = 1
+  }
+  printf "%.6f %d", d, spike
+}')
+EOF
+: "${delta_cost:=0}"
+: "${cost_spike:=0}"
+
+# Context urgency flag
+ctx_urgent=0
+if [ -n "$used_pct" ]; then
+  ctx_urgent=$(awk -v p="$used_pct" -v t="$CLAUDE_ADVISE_CTX_PCT" 'BEGIN{print (p+0 >= t+0) ? 1 : 0}')
+fi
+
+# Top-tool share of total tool bytes
+top_share=0
+if [ "${total_tool_bytes:-0}" -gt 0 ] 2>/dev/null; then
+  top_share=$(awk -v a="$top_bytes" -v b="$total_tool_bytes" 'BEGIN{printf "%.0f", (a/b)*100}')
+fi
+
 # --- assemble line ---
 parts=()
 
@@ -159,25 +218,43 @@ parts=()
 parts+=("${BOLD}${dir_name}${RST}")
 [ -n "$branch" ] && parts+=("${GREEN}${branch}${RST}")
 
+# Turn counter (only meaningful once we have at least one turn)
+if [ "${user_turns:-0}" -gt 0 ] 2>/dev/null; then
+  parts+=("${DIM}t:${user_turns}${RST}")
+fi
+
 if [ "$tok_raw" -gt 0 ] 2>/dev/null; then
   extra=""
   [ "$delta_tok" -gt 0 ] 2>/dev/null && extra=" $(format_delta "$delta_tok")"
   pct_part=""
-  [ -n "$used_pct" ] && pct_part=$(awk -v p="$used_pct" 'BEGIN{printf " %.0f%%", p+0}')
+  if [ -n "$used_pct" ]; then
+    ctx_bang=""
+    [ "$ctx_urgent" = "1" ] && ctx_bang="!"
+    pct_part=$(awk -v p="$used_pct" -v b="$ctx_bang" 'BEGIN{printf " %s%.0f%%", b, p+0}')
+  fi
   tok_display="${YELLOW}${tok_str} tok${RST}${DIM}(${extra# }${pct_part})${RST}"
   parts+=("$tok_display")
 fi
 
 if [ -n "$top_tool" ] && [ "$top_bytes" -gt 0 ] 2>/dev/null; then
   t_tok=$(format_tokens $(( top_bytes / 4 )))
+  share_part=""
+  [ "${top_share:-0}" -gt 0 ] 2>/dev/null && share_part="/${top_share}%"
   extra_top=""
   [ "$delta_top" -gt 0 ] 2>/dev/null && extra_top=" ${DIM}($(format_delta "$delta_top"))${RST}"
-  parts+=("${MAGENTA}⬆${top_tool} ${t_tok}${RST}${extra_top}")
+  parts+=("${MAGENTA}⬆${top_tool} ${t_tok}${share_part}${RST}${extra_top}")
 fi
 
 if [ -n "$cost_usd" ] && [ "$cost_usd" != "0" ] && [ "$cost_usd" != "0.0" ]; then
   cost_fmt=$(awk -v c="$cost_usd" 'BEGIN{printf "$%.4f", c+0}')
-  parts+=("${MAGENTA}${cost_fmt}${RST}")
+  cost_extra=""
+  if [ "$(awk -v d="$delta_cost" 'BEGIN{print (d+0 > 0.0001) ? 1 : 0}')" = "1" ]; then
+    bang=""
+    [ "$cost_spike" = "1" ] && bang="!"
+    cost_extra=$(awk -v d="$delta_cost" -v b="$bang" 'BEGIN{printf "(%s+$%.4f)", b, d}')
+    cost_extra=" ${DIM}${cost_extra}${RST}"
+  fi
+  parts+=("${MAGENTA}${cost_fmt}${RST}${cost_extra}")
 fi
 
 result=""
