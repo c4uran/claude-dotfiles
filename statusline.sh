@@ -136,6 +136,44 @@ fi
 : "${top_bytes:=0}"
 : "${total_tool_bytes:=0}"
 
+# --- process counts: sessions · system agents · session agents ---
+# Subagents are identified by --input-format stream-json flag (never set on interactive sessions).
+# Portable: awk strips leading path so /usr/bin/claude and claude both match.
+_proc_counts=$(ps -eo args 2>/dev/null | awk '
+  {
+    b = $1; sub(/.*\//, "", b)
+    if (b == "claude") {
+      if (/--input-format[[:space:]]stream-json/) sys_ag++
+      else sess++
+    }
+  }
+  END { printf "%d %d", sess+0, sys_ag+0 }
+')
+total_sessions=$(printf '%s' "$_proc_counts" | awk '{print $1+0}')
+total_sys_agents=$(printf '%s' "$_proc_counts" | awk '{print $2+0}')
+
+# Walk up PPID chain to find the ancestor claude PID (max 5 hops).
+# The statusline is spawned as: claude → bash statusline.sh, so PPID is usually claude.
+_walk=$PPID; _parent_claude=""; _depth=0
+while [ "$_depth" -lt 5 ]; do
+  _w=$(printf '%s' "${_walk:-}" | tr -d '[:space:]')
+  case "$_w" in ''|0|1) break ;; esac
+  _wcomm=$(ps -o comm= -p "$_w" 2>/dev/null | tr -d '[:space:]')
+  if [ "$_wcomm" = "claude" ]; then
+    _parent_claude=$_w; break
+  fi
+  _walk=$(ps -o ppid= -p "$_w" 2>/dev/null)
+  _depth=$(( _depth + 1 ))
+done
+
+sess_agents=0
+if [ -n "$_parent_claude" ]; then
+  sess_agents=$(ps -eo ppid,args 2>/dev/null | awk -v p="$_parent_claude" \
+    '$1+0==p+0 && /--input-format[[:space:]]stream-json/{c++} END{print c+0}')
+fi
+: "${total_sessions:=0}"
+: "${total_sys_agents:=0}"
+
 # --- per-turn delta: baseline snapshots at the start of each user turn ---
 session_id=$(jq_field '.session_id // empty')
 state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-statusline"
@@ -217,6 +255,9 @@ parts=()
 [ -n "$model_short" ] && parts+=("${CYAN}${model_short}${RST}")
 parts+=("${BOLD}${dir_name}${RST}")
 [ -n "$branch" ] && parts+=("${GREEN}${branch}${RST}")
+
+# Sessions (s:N) and agents system/session (ag:N/N) — always shown
+parts+=("${DIM}s:${total_sessions} ag:${total_sys_agents}/${sess_agents}${RST}")
 
 # Turn counter (only meaningful once we have at least one turn)
 if [ "${user_turns:-0}" -gt 0 ] 2>/dev/null; then
