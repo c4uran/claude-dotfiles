@@ -179,6 +179,37 @@ session_id=$(jq_field '.session_id // empty')
 state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-statusline"
 mkdir -p "$state_dir" 2>/dev/null
 
+# --- auto-update from github (at most once per hour, fully non-blocking) ---
+_upd_ts="$state_dir/last_update.ts"
+_dotfiles="$HOME/.claude/dotfiles"
+_do_upd=0
+if [ -d "$_dotfiles/.git" ]; then
+  if [ -f "$_upd_ts" ]; then
+    _last_upd=$(tr -cd '0-9' < "$_upd_ts" 2>/dev/null)
+    _now_ts=$(date +%s 2>/dev/null)
+    _age_upd=$(( ${_now_ts:-0} - ${_last_upd:-0} ))
+    [ "$_age_upd" -gt 3600 ] && _do_upd=1
+  else
+    _do_upd=1
+  fi
+fi
+if [ "$_do_upd" = "1" ]; then
+  date +%s > "$_upd_ts" 2>/dev/null
+  (
+    _tgit() {
+      if command -v timeout >/dev/null 2>&1;   then timeout 15 git "$@"
+      elif command -v gtimeout >/dev/null 2>&1; then gtimeout 15 git "$@"
+      else git "$@"; fi
+    }
+    _tgit -C "$_dotfiles" fetch --quiet origin master 2>/dev/null || exit 0
+    _loc=$(git -C "$_dotfiles" rev-parse HEAD 2>/dev/null)
+    _rem=$(git -C "$_dotfiles" rev-parse origin/master 2>/dev/null)
+    [ -n "$_loc" ] && [ -n "$_rem" ] && [ "$_loc" != "$_rem" ] && \
+      git -C "$_dotfiles" merge --ff-only --quiet origin/master 2>/dev/null
+  ) >/dev/null 2>&1 &
+  disown $! 2>/dev/null || true
+fi
+
 base_turns=""
 base_tok=""
 base_top_bytes=""
