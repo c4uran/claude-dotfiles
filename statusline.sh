@@ -228,27 +228,42 @@ fi
 base_turns=""
 base_tok=""
 base_cost=""
+compacted=0
+compact_saved=0
 if [ -n "$session_id" ]; then
   state_file="$state_dir/$session_id.state"
   if [ -r "$state_file" ]; then
     while IFS='=' read -r k v; do
       case "$k" in
-        turns) base_turns=$v ;;
-        tok)   base_tok=$v ;;
-        cost)  base_cost=$v ;;
+        turns)         base_turns=$v ;;
+        tok)           base_tok=$v ;;
+        cost)          base_cost=$v ;;
+        compacted)     compacted=$v ;;
+        compact_saved) compact_saved=$v ;;
       esac
     done < "$state_file"
   fi
 
   # Promote baseline on first run OR when a new user turn has appeared.
   if [ -z "$base_turns" ] || [ "$user_turns" != "$base_turns" ]; then
+    # Detect compact: tok_raw dropped since last baseline
+    new_compacted=0
+    new_saved=0
+    if [ -n "$base_tok" ] && [ "$(( tok_raw + 0 ))" -lt "$(( base_tok + 0 ))" ]; then
+      new_compacted=1
+      new_saved=$(( base_tok - tok_raw ))
+    fi
     {
-      printf 'turns=%s\n' "$user_turns"
-      printf 'tok=%s\n'   "$tok_raw"
-      printf 'cost=%s\n'  "${cost_usd:-0}"
+      printf 'turns=%s\n'         "$user_turns"
+      printf 'tok=%s\n'           "$tok_raw"
+      printf 'cost=%s\n'          "${cost_usd:-0}"
+      printf 'compacted=%s\n'     "$new_compacted"
+      printf 'compact_saved=%s\n' "$new_saved"
     } > "$state_file" 2>/dev/null
     base_tok=$tok_raw
     base_cost=${cost_usd:-0}
+    compacted=$new_compacted
+    compact_saved=$new_saved
   fi
 fi
 
@@ -362,6 +377,10 @@ if [ "$tok_raw" -gt 0 ] 2>/dev/null; then
   # show in/out split so cost asymmetry (output 5x pricier) is visible
   tok_display="${YELLOW}${tok_str} tok${RST}${DIM}(${tok_in_str}in/${tok_out_str}out${extra}${pct_part})${RST}"
   parts+=("$tok_display")
+fi
+
+if [ "${compacted:-0}" = "1" ] && [ "${compact_saved:-0}" -gt 0 ] 2>/dev/null; then
+  parts+=("${GREEN}↓compact $(format_delta "-$compact_saved") tok${RST}")
 fi
 
 if [ -n "$top_tool" ] && [ "$top_bytes" -gt 0 ] 2>/dev/null; then
