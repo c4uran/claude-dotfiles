@@ -3,7 +3,7 @@
 # Claude Code diagnostic status line.
 #
 # Format:
-#   model | dir | branch | t:N | Xk tok(+Δ [!]pct%) | ⬆tool Xk/share% | $cost(+Δ[!])
+#   N model dir@branch | static ~Xk tok | s:N ag:N | Xk tok(in/out +Δ [!]pct%) | top:tool Xk/share% | $cost(+Δ[!])
 #
 # The line is intentionally dense: every field carries a signal you can
 # diagnose at a glance (or paste to another Claude and it can diagnose it
@@ -38,13 +38,30 @@ else
 fi
 SEP_CHAR="${SEP}|${RST}"
 
-jq_field() { printf '%s' "$input" | jq -r "$1" 2>/dev/null; }
+# Parse all fields from input JSON in a single jq pass — avoids 8 subshell spawns.
+{
+  read -r model
+  read -r cwd
+  read -r total_session_in
+  read -r total_session_out
+  read -r used_pct
+  read -r cost_usd
+  read -r transcript
+  read -r session_id
+} < <(printf '%s' "$input" | jq -r '
+  .model.display_name // .model.id // "",
+  .workspace.current_dir // .cwd // "",
+  (.context_window.total_input_tokens // 0 | tostring),
+  (.context_window.total_output_tokens // 0 | tostring),
+  .context_window.used_percentage // "",
+  .cost.total_cost_usd // "",
+  .transcript_path // "",
+  .session_id // ""
+' 2>/dev/null)
 
 # --- model / dir / git branch ---
-model=$(jq_field '.model.display_name // .model.id // empty')
 model_short="${model#Claude }"
 
-cwd=$(jq_field '.workspace.current_dir // .cwd // empty')
 dir_name=$(basename "${cwd:-$(pwd)}")
 
 branch=""
@@ -53,14 +70,9 @@ if [ -n "$cwd" ] && command -v git >/dev/null 2>&1; then
 fi
 
 # --- tokens & cost ---
-total_session_in=$(jq_field '.context_window.total_input_tokens // 0')
-total_session_out=$(jq_field '.context_window.total_output_tokens // 0')
 tok_in=${total_session_in:-0}
 tok_out=${total_session_out:-0}
 tok_raw=$(( tok_in + tok_out ))
-
-used_pct=$(jq_field '.context_window.used_percentage // empty')
-cost_usd=$(jq_field '.cost.total_cost_usd // empty')
 
 # k/M formatter via awk (no bc dependency).
 format_tokens() {
@@ -86,7 +98,7 @@ tok_in_str=$(format_tokens "$tok_in")
 tok_out_str=$(format_tokens "$tok_out")
 
 # --- transcript parsing: user-turn count + top tool by bytes ---
-transcript=$(jq_field '.transcript_path // empty')
+# (transcript and session_id already parsed above)
 
 # Portable 'timeout' wrapper (macOS without coreutils has neither).
 _run_jq() {
@@ -179,7 +191,6 @@ fi
 : "${total_sys_agents:=0}"
 
 # --- per-turn delta: baseline snapshots at the start of each user turn ---
-session_id=$(jq_field '.session_id // empty')
 state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-statusline"
 mkdir -p "$state_dir" 2>/dev/null
 
@@ -216,17 +227,15 @@ fi
 
 base_turns=""
 base_tok=""
-base_top_bytes=""
 base_cost=""
 if [ -n "$session_id" ]; then
   state_file="$state_dir/$session_id.state"
   if [ -r "$state_file" ]; then
     while IFS='=' read -r k v; do
       case "$k" in
-        turns)     base_turns=$v ;;
-        tok)       base_tok=$v ;;
-        top_bytes) base_top_bytes=$v ;;
-        cost)      base_cost=$v ;;
+        turns) base_turns=$v ;;
+        tok)   base_tok=$v ;;
+        cost)  base_cost=$v ;;
       esac
     done < "$state_file"
   fi
@@ -236,17 +245,16 @@ if [ -n "$session_id" ]; then
     {
       printf 'turns=%s\n' "$user_turns"
       printf 'tok=%s\n'   "$tok_raw"
-      printf 'top_bytes=%s\n' "$top_bytes"
       printf 'cost=%s\n'  "${cost_usd:-0}"
     } > "$state_file" 2>/dev/null
     base_tok=$tok_raw
-    base_top_bytes=$top_bytes
     base_cost=${cost_usd:-0}
   fi
 fi
 
-delta_tok=$(( tok_raw - ${base_tok:-$tok_raw} ))
-[ "$delta_tok" -lt 0 ] 2>/dev/null && delta_tok=0
+_base_tok=$(( ${base_tok:-$tok_raw} + 0 ))
+delta_tok=$(( tok_raw - _base_tok ))
+[ "$delta_tok" -lt 0 ] && delta_tok=0
 # delta_top removed: misleads when top tool changes between turns
 
 # Cost delta & outlier detection (float math → awk).
