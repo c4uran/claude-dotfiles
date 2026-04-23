@@ -112,9 +112,17 @@ _run_jq() {
 }
 
 user_turns=0
-top_tool=""
-top_bytes=0
+top_tool="";  top_calls=0;  top_bytes=0
+top2_tool=""; top2_calls=0; top2_bytes=0
 total_tool_bytes=0
+
+# mcp__server__tool → server:tool, everything else unchanged
+abbrev_tool() {
+  printf '%s' "$1" | awk '{
+    if (match($0, /^mcp__([^_]+)__(.+)/, a)) printf "%s:%s", a[1], a[2]
+    else print $0
+  }'
+}
 if [ -n "$transcript" ] && [ -f "$transcript" ]; then
   user_turns=$(_run_jq -c '
     select(.type=="user"
@@ -123,10 +131,12 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
   ' "$transcript" 2>/dev/null | wc -l | tr -d '[:space:]')
   : "${user_turns:=0}"
 
-  # Emits three space-separated values: total_bytes top_name top_bytes
+  # Emits: total_bytes t1_name t1_calls t1_bytes t2_name t2_calls t2_bytes
   top_line=$(_run_jq -sr '
     [.[] | .message.content? | select(type=="array") | .[]] as $all
     | ($all | map(select(.type=="tool_use") | {key:.id, value:.}) | from_entries) as $byid
+    | ($all | map(select(.type=="tool_use")) | group_by(.name)
+        | map({key:.[0].name, value:(.|length)}) | from_entries) as $calls
     | (
         ($all | map(select(.type=="tool_use")
           | {name:.name, bytes:(.input|tostring|length)})) +
@@ -136,17 +146,17 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
               | {name:$n, bytes:(.content|tostring|length)}))
       )
     | group_by(.name)
-    | map({name:.[0].name, bytes:(map(.bytes)|add)}) as $grouped
+    | map({name:.[0].name, bytes:(map(.bytes)|add), calls:($calls[.[0].name] // 0)}) as $grouped
     | ($grouped | map(.bytes) | add // 0) as $total
-    | ($grouped | sort_by(-.bytes) | .[0] // {name:"",bytes:0}) as $top
-    | "\($total) \($top.name) \($top.bytes)"
+    | ($grouped | sort_by(-.bytes) | .[0:2]) as $top2
+    | "\($total) \($top2[0].name // "") \($top2[0].calls // 0) \($top2[0].bytes // 0) \($top2[1].name // "") \($top2[1].calls // 0) \($top2[1].bytes // 0)"
   ' "$transcript" 2>/dev/null)
   if [ -n "$top_line" ]; then
     # shellcheck disable=SC2086
     set -- $top_line
     total_tool_bytes=${1:-0}
-    top_tool=${2:-}
-    top_bytes=${3:-0}
+    top_tool=${2:-};  top_calls=${3:-0};  top_bytes=${4:-0}
+    top2_tool=${5:-}; top2_calls=${6:-0}; top2_bytes=${7:-0}
   fi
 fi
 : "${top_bytes:=0}"
@@ -384,10 +394,23 @@ if [ "${compacted:-0}" = "1" ] && [ "${compact_saved:-0}" -gt 0 ] 2>/dev/null; t
 fi
 
 if [ -n "$top_tool" ] && [ "$top_bytes" -gt 0 ] 2>/dev/null; then
-  t_tok=$(format_tokens $(( top_bytes / 4 )))
-  share_part=""
-  [ "${top_share:-0}" -gt 0 ] 2>/dev/null && share_part="/${top_share}%"
-  parts+=("${MAGENTA}top:${top_tool} ${t_tok}${share_part}${RST}")
+  _t1=$(abbrev_tool "$top_tool")
+  _t1_share=$(awk -v a="$top_bytes" -v b="$total_tool_bytes" \
+    'BEGIN{printf "%.0f", (b>0)?(a/b)*100:0}')
+  _t1_str="${_t1}×${top_calls}/${_t1_share}%"
+
+  # show second tool if it holds >10% of tool bytes
+  _t2_str=""
+  if [ -n "$top2_tool" ] && [ "${top2_bytes:-0}" -gt 0 ] 2>/dev/null; then
+    _t2_share=$(awk -v a="$top2_bytes" -v b="$total_tool_bytes" \
+      'BEGIN{printf "%.0f", (b>0)?(a/b)*100:0}')
+    if [ "$_t2_share" -ge 10 ] 2>/dev/null; then
+      _t2=$(abbrev_tool "$top2_tool")
+      _t2_str=" ${_t2}×${top2_calls}/${_t2_share}%"
+    fi
+  fi
+
+  parts+=("${MAGENTA}top:${_t1_str}${_t2_str}${RST}")
 fi
 
 if [ -n "$cost_usd" ] && [ "$cost_usd" != "0" ] && [ "$cost_usd" != "0.0" ]; then
