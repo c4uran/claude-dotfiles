@@ -11,23 +11,33 @@ Claude can immediately tell what's going wrong.
 **Format:**
 
 ```
-<N> <model> <dir>@<branch> | static ~<Xk> tok | s:<N> ag:<N> | <Xk> tok(<in>in/<out>out +<Δ> [!]<pct>%) | top:<tool> <Xk>/<share>% | $<cost> (+<Δcost>[!])
+<N> <model> <dir>@<branch> | f~<Xk> | s:<N> ag:<N> | <Xk> tok(↑<in>/↓<out> +<Δ> [!]<pct>%) | [↓compact -<Xk> tok] | top:<tool>×<calls>/<share>% [<tool2>×<calls>/<share>%] | $<cost> (+<Δcost>[!])
 ```
 
-- `N` — your turn number, bare prefix, no separator
+- `N` — your turn number, bare prefix
 - `model` — abbreviated: `S4.6` = Sonnet 4.6, `O4.7` = Opus 4.7, `H4.5` = Haiku 4.5
-- `static ~Xk tok` — estimated fixed overhead: CLAUDE.md + MEMORY.md + skill list
+- `f~Xk` — disk overhead: CLAUDE.md + all memory/*.md + skill list (bytes/4)
+- `↑in/↓out` — input vs output token split (output costs 5× more)
+- `↓compact` — appears for one turn after `/compact`, shows freed tokens
+- `tool×N/share%` — top tool by bytes: call count + share of total tool traffic; second tool shown if ≥10%
+- MCP tools abbreviated: `mcp__ctags__get_file` → `ctags:get_file`
 
 Example (healthy):
 
 ```
-7 S4.6 myproject@main | static ~8.2k tok | s:1 ag:0 | 14.2k tok(11.0in/3.2out +1.1k 7%) | top:Read 4.2k/38% | $0.0312 (+$0.0180)
+7 S4.6 myproject@main | f~2.5k | s:1 ag:0 | 14.2k tok(↑11.0/↓3.2 +1.1k 7%) | top:Read×12/38% Bash×3/25% | $0.0312 (+$0.0180)
+```
+
+Example (after compact):
+
+```
+8 S4.6 myproject@main | f~2.5k | s:1 ag:0 | 32k tok(↑28/↓4 +0 12%) | ↓compact -85k tok | top:Read×4/42% | $0.12 (+$0.00)
 ```
 
 Example (panic):
 
 ```
-18 O4.7 ctf@master | static ~6.1k tok | s:1 ag:2 | 195k tok(140in/55out +85k !92%) | top:Bash 180k/78% | $5.20 (!+$1.80)
+18 O4.7 ctf@master | f~6.1k | s:1 ag:2 | 195k tok(↑140/↓55 +85k !92%) | top:Bash×8/78% | $5.20 (!+$1.80)
 ```
 
 ### How to read the line
@@ -36,24 +46,25 @@ Example (panic):
 |---|---|---|
 | `N` | user turn number | divide `$cost` by N for average cost per turn |
 | `S4.6` | active model | Opus ~5× pricier than Sonnet; use `/model sonnet` for simple tasks |
-| `static ~Xk tok` | fixed overhead from project files | grows if CLAUDE.md / memory index bloats |
-| `Xk tok` | total session input+output tokens | compare with `pct%`, not in isolation |
-| `(Xin/Yout ...)` | input vs output split | output costs 5× more; high `out` = expensive response |
+| `f~Xk` | disk file overhead (CLAUDE.md + memory + skills) | grows if memory index or CLAUDE.md bloats |
+| `↑Xk/↓Yk` | input / output token split | output costs 5×; high `↓` = expensive response |
 | `+Δ` | tokens added this turn (always shown, `+0` if none) | large delta = this request is heavy |
 | `pct%` | context window fill | ≥80% → `!` → time to `/compact` |
-| `top:tool Xk` | top tool by `tool_use.input + tool_result.content` bytes | who is the bottleneck |
-| `/N%` | top tool's share of all tool bytes | 70%+ = clear bottleneck; 20–30% = balanced |
-| `$X.XXXX` | total session cost | divide by turn number for average per request |
+| `↓compact -Xk` | tokens freed by last `/compact` | visible for one turn only |
+| `tool×N/share%` | top tool: call count + share of all tool bytes | `×1/40%` = one huge call → use `limit`; `×40/40%` = frequency problem → reduce calls |
+| second tool | shown only when its share ≥10% | two tools both large = distributed bottleneck |
+| `$X.XXXX` | total session cost | divide by N for average per request |
 | `(+$Δ)` | cost delta this turn | full price of this request |
-| `(!+$Δ)` | **outlier** — this turn ≥ 2.5× avg of prior turns | unusually expensive, check last tool calls |
+| `(!+$Δ)` | **outlier** — this turn ≥2.5× avg of prior turns | unusually expensive, check last tool calls |
 
 **Triage order:**
 
-1. `!pct%` → context overflowing, nothing else matters — run `/compact`
-2. `(!+$Δ)` → cost spike this turn — open transcript, find the big tool result
-3. `top:tool` share ≥70% → bottleneck in that tool (usually `Bash` with fat output, or `Read` without `limit`)
-4. `$cost / N` growing non-linearly → session degrading, consider `/compact` or new window
-5. All fields small → healthy session
+1. `!pct%` → context overflowing — run `/compact`
+2. `(!+$Δ)` → cost spike — open transcript, find the big tool result
+3. `tool×1/N%` high share → one fat call (Read without `limit`, Bash with verbose output)
+4. `tool×N/N%` high share, many calls → frequency problem, find the loop
+5. Two tools both ≥25% → balanced bottleneck, no single fix
+6. All fields small → healthy session
 
 ### Thresholds
 
@@ -95,8 +106,8 @@ Add to `~/.claude/settings.json`:
 
 Required:
 
-- `bash` >= 3.2 (stock macOS ships this)
-- `jq` >= 1.5 (`from_entries` needed; avoids `INDEX` from jq 1.6 for broader compatibility)
+- `bash` ≥ 3.2 (stock macOS ships this)
+- `jq` ≥ 1.5 (`from_entries` needed; avoids `INDEX` from jq 1.6 for broader compatibility)
 - `awk` (any — BSD awk / gawk / mawk)
 
 Optional:
@@ -120,10 +131,9 @@ State is stored in `$XDG_CACHE_HOME/claude-statusline/<session_id>.state`
 On each render the script:
 
 1. Counts real user turns in the transcript (filters out `tool_result` messages).
-2. If the counter grew — takes a new **baseline** (current tokens, top-tool bytes, cost). This marks "start of new request".
-3. Otherwise — shows `current − baseline` in parens. Delta grows monotonically through the turn until you send the next message.
-
-This means the delta shows the full cost of **this request**, not noise between renders.
+2. If the counter grew — takes a new **baseline** (tokens, cost). If tokens dropped since the last baseline, records a compact event with the freed amount.
+3. Otherwise — shows `current − baseline` in parens. Delta grows monotonically through the turn.
 
 The top tool is computed from the full transcript: `tool_use.input` and
-`tool_result.content` bytes are summed per tool name and the largest wins.
+`tool_result.content` bytes summed per tool name. Call count = number of
+`tool_use` entries for that name. Second tool shown only when share ≥10%.
