@@ -1,84 +1,86 @@
 # claude-dotfiles
 
-Персональные скрипты и конфиги для Claude Code. Работают на macOS, Linux
-(Debian/Ubuntu/Arch/Alpine), WSL и Synology DSM (через Entware).
+Scripts and configs for Claude Code. Work on macOS, Linux
+(Debian/Ubuntu/Arch/Alpine), and WSL.
 
 ## statusline.sh
 
-Диагностический statusLine: строка плотно упакована так, чтобы её можно
-было скопировать в чат другому Claude'у, и он сам понял, куда копать.
+Diagnostic status line — densely packed so you can paste it into chat and
+Claude can immediately tell what's going wrong.
 
-**Формат:**
-
-```
-<model> | <dir> | <branch> | t:<turns> | <Xk> tok(+<Δ> [!]<pct>%) | ⬆<tool> <Xk>/<share>% (+<Δ>) | $<cost> (+<Δcost>[!])
-```
-
-Пример (всё спокойно):
+**Format:**
 
 ```
-Opus 4.6 | ctf | master | t:12 | 89.4k tok(+2.5k 9%) | ⬆Bash 17.1k/45% (+800) | $0.4231 (+$0.0315)
+<N> <model> <dir>@<branch> | static ~<Xk> tok | s:<N> ag:<N> | <Xk> tok(<in>in/<out>out +<Δ> [!]<pct>%) | top:<tool> <Xk>/<share>% | $<cost> (+<Δcost>[!])
 ```
 
-Пример (паника):
+- `N` — your turn number, bare prefix, no separator
+- `model` — abbreviated: `S4.6` = Sonnet 4.6, `O4.7` = Opus 4.7, `H4.5` = Haiku 4.5
+- `static ~Xk tok` — estimated fixed overhead: CLAUDE.md + MEMORY.md + skill list
+
+Example (healthy):
 
 ```
-Opus 4.6 | ctf | master | t:18 | 195k tok(+85k !92%) | ⬆Bash 180k/78% (+60k) | $5.20 (!+$1.80)
+7 S4.6 myproject@main | static ~8.2k tok | s:1 ag:0 | 14.2k tok(11.0in/3.2out +1.1k 7%) | top:Read 4.2k/38% | $0.0312 (+$0.0180)
 ```
 
-### Как читать строку (шпаргалка для диагноза)
+Example (panic):
 
-| Поле | Что означает | На что смотреть |
+```
+18 O4.7 ctf@master | static ~6.1k tok | s:1 ag:2 | 195k tok(140in/55out +85k !92%) | top:Bash 180k/78% | $5.20 (!+$1.80)
+```
+
+### How to read the line
+
+| Field | Meaning | What to watch |
 |---|---|---|
-| `Opus 4.6` | активная модель | Opus ~5× дороже Sonnet; если задача простая — `/model sonnet` |
-| `t:N` | номер user-тёрна в сессии | делит `$cost` для оценки средней за запрос |
-| `Xk tok` | суммарные in+out токены сессии | сами по себе мало что говорят — сравнивай с `pct%` |
-| `(+Δ ...)` | приращение за **текущий** тёрн (не за рендер) | большие дельты → текущий запрос что-то тяжёлое делает |
-| `pct%` | заполнение контекст-окна | ≥80% → `!` → пора `/compact` |
-| `!pct%` | urgent context | близок лимит контекста, **действуй** |
-| `⬆tool Xk` | топ-тул по сумме байтов `tool_use.input + tool_result.content` | это «кто узкое место» в сессии |
-| `/N%` | **доля топ-тула** от всех тул-байтов | 70%+ → явный bottleneck, смотреть туда; ~20-30% → бюджет сбалансирован |
-| `(+Δ)` возле тула | что этот тул сожрал **в текущем тёрне** | растёт быстро = сейчас он активно работает |
-| `$X.XXXX` | суммарная стоимость сессии (из `cost.total_cost_usd`) | делится на `t:N` для средней за запрос |
-| `(+$Δ)` | дельта стоимости за текущий тёрн | полная цена этого запроса |
-| `(!+$Δ)` | **outlier!** — этот запрос ≥ 2.5× средней предыдущих | запрос нетипично дорогой, смотри что он делает |
+| `N` | user turn number | divide `$cost` by N for average cost per turn |
+| `S4.6` | active model | Opus ~5× pricier than Sonnet; use `/model sonnet` for simple tasks |
+| `static ~Xk tok` | fixed overhead from project files | grows if CLAUDE.md / memory index bloats |
+| `Xk tok` | total session input+output tokens | compare with `pct%`, not in isolation |
+| `(Xin/Yout ...)` | input vs output split | output costs 5× more; high `out` = expensive response |
+| `+Δ` | tokens added this turn (always shown, `+0` if none) | large delta = this request is heavy |
+| `pct%` | context window fill | ≥80% → `!` → time to `/compact` |
+| `top:tool Xk` | top tool by `tool_use.input + tool_result.content` bytes | who is the bottleneck |
+| `/N%` | top tool's share of all tool bytes | 70%+ = clear bottleneck; 20–30% = balanced |
+| `$X.XXXX` | total session cost | divide by turn number for average per request |
+| `(+$Δ)` | cost delta this turn | full price of this request |
+| `(!+$Δ)` | **outlier** — this turn ≥ 2.5× avg of prior turns | unusually expensive, check last tool calls |
 
-**Правило первого взгляда, от срочности к расслабленности:**
+**Triage order:**
 
-1. Есть `!pct%` → **контекст переполняется**, остальное неважно, надо `/compact`.
-2. Есть `(!+$Δ)` → **cost spike в этом тёрне**, открой последние tool_use/tool_result в транскрипте, ищи большие выхлопы.
-3. `⬆tool` доля ≥70% → **бутылочное горло в этом инструменте** (обычно `Bash` с жирными cat/find, или `Read` без `limit`), нужно оптимизировать паттерн использования.
-4. `$cost / t:N` растёт нелинейно → сессия деградирует, подумай о `/compact` или новом окне.
-5. Все поля маленькие, дельт нет → здоровая сессия, копать не во что.
+1. `!pct%` → context overflowing, nothing else matters — run `/compact`
+2. `(!+$Δ)` → cost spike this turn — open transcript, find the big tool result
+3. `top:tool` share ≥70% → bottleneck in that tool (usually `Bash` with fat output, or `Read` without `limit`)
+4. `$cost / N` growing non-linearly → session degrading, consider `/compact` or new window
+5. All fields small → healthy session
 
-### Пороги
+### Thresholds
 
-Настраиваются через env vars при запуске Claude Code:
+Tunable via env vars:
 
-| env | по умолчанию | что делает |
+| env | default | effect |
 |---|---|---|
-| `CLAUDE_ADVISE_CTX_PCT` | `80` | % контекста для `!` флага |
-| `CLAUDE_ADVISE_COST_RATIO` | `2.5` | во сколько раз Δcost должен превышать среднюю, чтобы считаться spike |
-| `CLAUDE_ADVISE_COST_FLOOR` | `0.10` | минимум Δcost USD, чтобы spike вообще засчитался (иначе шум на дешёвых сессиях) |
+| `CLAUDE_ADVISE_CTX_PCT` | `80` | context % that triggers `!` flag |
+| `CLAUDE_ADVISE_COST_RATIO` | `2.5` | how many × avg a turn must cost to be flagged as spike |
+| `CLAUDE_ADVISE_COST_FLOOR` | `0.10` | minimum Δcost USD for spike to fire (suppresses noise on cheap sessions) |
 
-### Установка
+### Install
 
-Клонируй репо в постоянное место (не `/tmp`) и запусти инсталлер:
+Clone into a permanent location and run the installer:
 
 ```bash
 git clone https://github.com/c4uran/claude-dotfiles.git ~/.claude/dotfiles
 bash ~/.claude/dotfiles/install.sh
 ```
 
-Инсталлер:
-1. Определит ОС (macOS / Debian / Arch / Alpine / WSL / Synology).
-2. Проверит наличие `bash`, `jq >= 1.5`, `awk`. Если чего-то нет — покажет
-   команду для твоего пакетного менеджера и выйдет с кодом 1.
-3. Сделает симлинк `~/.claude/statusline.sh -> dotfiles/statusline.sh`
-   (старый файл, если был, сохранит в `.bak.<ts>`).
-4. Напечатает snippet для `settings.json` — добавь руками.
+The installer:
+1. Detects OS (macOS / Debian / Arch / Alpine / WSL).
+2. Checks for `bash`, `jq >= 1.5`, `awk`. Prints install command and exits 1 if missing.
+3. Symlinks `~/.claude/statusline.sh → dotfiles/statusline.sh` (backs up existing file to `.bak.<ts>`).
+4. Prints the `settings.json` snippet to add manually.
 
-Добавь в `~/.claude/settings.json`:
+Add to `~/.claude/settings.json`:
 
 ```json
 {
@@ -89,54 +91,39 @@ bash ~/.claude/dotfiles/install.sh
 }
 ```
 
-### Зависимости
+### Dependencies
 
-Обязательные:
+Required:
 
-- `bash` >= 3.2 (macOS дефолт подходит)
-- `jq` >= 1.5 (нужен `from_entries` для парсинга транскрипта)
-- `awk` (любой — BSD awk / gawk / mawk)
+- `bash` >= 3.2 (stock macOS ships this)
+- `jq` >= 1.5 (`from_entries` needed; avoids `INDEX` from jq 1.6 for broader compatibility)
+- `awk` (any — BSD awk / gawk / mawk)
 
-Опциональные:
+Optional:
 
-- `git` — для показа текущей ветки в строке
+- `git` — for branch display
 
-Команды установки по платформам:
+Install by platform:
 
-| ОС | Команда |
+| OS | Command |
 |---|---|
 | macOS | `brew install jq git` |
 | Debian / Ubuntu / WSL | `sudo apt-get install -y jq git` |
 | Arch | `sudo pacman -S --needed jq git` |
 | Alpine | `sudo apk add jq git` |
-| Synology DSM | `opkg install jq git` (нужен [Entware](https://github.com/Entware/Entware/wiki/Install-on-Synology-NAS)) |
 
-### Как работает per-turn дельта
+### How per-turn delta works
 
-State хранится в `$XDG_CACHE_HOME/claude-statusline/<session_id>.state`
-(по умолчанию — `~/.cache/claude-statusline/`).
+State is stored in `$XDG_CACHE_HOME/claude-statusline/<session_id>.state`
+(default: `~/.cache/claude-statusline/`).
 
-На каждом рендере скрипт:
+On each render the script:
 
-1. Считает число реальных user-тёрнов в транскрипте (`tool_result`-сообщения
-   отфильтровываются).
-2. Если счётчик вырос с прошлого раза — снимает новый **бейзлайн** (текущие
-   токены, top-tool bytes, cost). Это момент «старт нового запроса».
-3. Иначе — показывает `current − baseline` в скобках. Дельта растёт
-   монотонно весь тёрн, пока ты не отправишь следующее сообщение.
+1. Counts real user turns in the transcript (filters out `tool_result` messages).
+2. If the counter grew — takes a new **baseline** (current tokens, top-tool bytes, cost). This marks "start of new request".
+3. Otherwise — shows `current − baseline` in parens. Delta grows monotonically through the turn until you send the next message.
 
-Таким образом в скобках ты видишь полную цену именно **этого запроса**,
-а не шум между отдельными рендерами статуслайна.
+This means the delta shows the full cost of **this request**, not noise between renders.
 
-Топ-тул считается по транскрипту: парсятся `tool_use.input` и
-`tool_result.content`, группируются по имени тула, берётся максимум.
-Дельта у топ-тула — прирост его байт с начала текущего тёрна (/4 ≈ токены).
-
-### Кросс-платформенность
-
-- Без `bc` (использует `awk` для форматирования).
-- Без жёсткой зависимости от GNU `timeout` (graceful fallback на macOS).
-- Без bashism'ов > 3.2, чтобы работало со стоковым `/bin/bash` на macOS.
-- `jq`-пайплайн не использует `INDEX` (которое появилось в jq 1.6) —
-  заменено на `from_entries`, чтобы работать на jq 1.5 (Synology/Entware,
-  старые дистрибутивы).
+The top tool is computed from the full transcript: `tool_use.input` and
+`tool_result.content` bytes are summed per tool name and the largest wins.

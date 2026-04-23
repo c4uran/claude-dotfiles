@@ -55,7 +55,9 @@ fi
 # --- tokens & cost ---
 total_session_in=$(jq_field '.context_window.total_input_tokens // 0')
 total_session_out=$(jq_field '.context_window.total_output_tokens // 0')
-tok_raw=$(( ${total_session_in:-0} + ${total_session_out:-0} ))
+tok_in=${total_session_in:-0}
+tok_out=${total_session_out:-0}
+tok_raw=$(( tok_in + tok_out ))
 
 used_pct=$(jq_field '.context_window.used_percentage // empty')
 cost_usd=$(jq_field '.cost.total_cost_usd // empty')
@@ -80,6 +82,8 @@ format_delta() {
 }
 
 tok_str=$(format_tokens "$tok_raw")
+tok_in_str=$(format_tokens "$tok_in")
+tok_out_str=$(format_tokens "$tok_out")
 
 # --- transcript parsing: user-turn count + top tool by bytes ---
 transcript=$(jq_field '.transcript_path // empty')
@@ -243,9 +247,7 @@ fi
 
 delta_tok=$(( tok_raw - ${base_tok:-$tok_raw} ))
 [ "$delta_tok" -lt 0 ] 2>/dev/null && delta_tok=0
-delta_top_bytes=$(( top_bytes - ${base_top_bytes:-$top_bytes} ))
-[ "$delta_top_bytes" -lt 0 ] 2>/dev/null && delta_top_bytes=0
-delta_top=$(( delta_top_bytes / 4 ))
+# delta_top removed: misleads when top tool changes between turns
 
 # Cost delta & outlier detection (float math → awk).
 # delta_cost = current - base_cost (0 if missing)
@@ -280,31 +282,76 @@ if [ "${total_tool_bytes:-0}" -gt 0 ] 2>/dev/null; then
   top_share=$(awk -v a="$top_bytes" -v b="$total_tool_bytes" 'BEGIN{printf "%.0f", (a/b)*100}')
 fi
 
+# --- static context file token estimate ---
+# Approximation: bytes / 4 across CLAUDE.md, MEMORY.md, and skills/*.md.
+# Uses cwd from JSON to locate the project CLAUDE.md.
+_ctx_bytes=0
+_ctx_claude_md="${cwd}/CLAUDE.md"
+# MEMORY.md path derived from cwd: /foo/bar/baz → project key -foo-bar-baz
+_ctx_memory_md=""
+if [ -n "$cwd" ]; then
+  _proj_key=$(printf '%s' "$cwd" | tr '/' '-')
+  _ctx_memory_md="$HOME/.claude/projects/${_proj_key}/memory/MEMORY.md"
+fi
+if [ -f "$_ctx_claude_md" ]; then
+  _sz=$(wc -c < "$_ctx_claude_md" 2>/dev/null | tr -d '[:space:]')
+  _ctx_bytes=$(( _ctx_bytes + ${_sz:-0} ))
+fi
+if [ -n "$_ctx_memory_md" ] && [ -f "$_ctx_memory_md" ]; then
+  _sz=$(wc -c < "$_ctx_memory_md" 2>/dev/null | tr -d '[:space:]')
+  _ctx_bytes=$(( _ctx_bytes + ${_sz:-0} ))
+fi
+# skills: only names+descriptions are auto-injected, not full files (~150 bytes each)
+_skill_count=$(ls "$HOME/.claude/skills/"*.md 2>/dev/null | wc -l | tr -d '[:space:]')
+_ctx_bytes=$(( _ctx_bytes + ${_skill_count:-0} * 150 ))
+# add ~6k tok constant for system prompt + tool schemas overhead
+_ctx_tok=$(( _ctx_bytes / 4 + 6000 ))
+_ctx_tok_str=""
+if [ "$_ctx_tok" -gt 0 ] 2>/dev/null; then
+  _ctx_tok_str=$(awk -v n="$_ctx_tok" 'BEGIN{
+    if (n >= 1000000)   printf "static ~%.1fM tok", n/1000000
+    else if (n >= 1000) printf "static ~%.1fk tok", n/1000
+    else                printf "static ~%d tok", n
+  }')
+fi
+
 # --- assemble line ---
 parts=()
 
-[ -n "$model_short" ] && parts+=("${CYAN}${model_short}${RST}")
-parts+=("${BOLD}${dir_name}${RST}")
-[ -n "$branch" ] && parts+=("${GREEN}${branch}${RST}")
+# Compact model: "Sonnet 4.6" → "S4.6", "Opus 4.7" → "O4.7", "Haiku 4.5" → "H4.5"
+model_abbr=$(printf '%s' "$model_short" | awk '{
+  if      ($1=="Sonnet") printf "S%s", $2
+  else if ($1=="Opus")   printf "O%s", $2
+  else if ($1=="Haiku")  printf "H%s", $2
+  else                   print $0
+}')
 
-# Sessions (s:N) and agents system/session (ag:N/N) — always shown
-parts+=("${DIM}s:${total_sessions} ag:${total_sys_agents}/${sess_agents}${RST}")
+# model + dir + branch as one compact field: "S4.6 infra@main"
+_header="${dir_name}"
+[ -n "$branch" ] && _header="${_header}${GREEN}@${branch}${RST}"
+[ -n "$model_abbr" ] && _header="${CYAN}${model_abbr}${RST} ${BOLD}${_header}"
+parts+=("${_header}${RST}")
 
-# Turn counter (only meaningful once we have at least one turn)
-if [ "${user_turns:-0}" -gt 0 ] 2>/dev/null; then
-  parts+=("${DIM}t:${user_turns}${RST}")
-fi
+[ -n "$_ctx_tok_str" ] && parts+=("${DIM}${_ctx_tok_str}${RST}")
+
+# s:N = interactive sessions machine-wide; ag:N = subagents this session / sys total
+_other_agents=$(( total_sys_agents - sess_agents ))
+[ "$_other_agents" -lt 0 ] && _other_agents=0
+_ag_str="ag:${sess_agents}"
+[ "$_other_agents" -gt 0 ] && _ag_str="${_ag_str}(+${_other_agents} other)"
+parts+=("${DIM}s:${total_sessions} ${_ag_str}${RST}")
 
 if [ "$tok_raw" -gt 0 ] 2>/dev/null; then
-  extra=""
-  [ "$delta_tok" -gt 0 ] 2>/dev/null && extra=" $(format_delta "$delta_tok")"
+  # always show delta so +0 is explicit (vs missing = ambiguous)
+  extra=" $(format_delta "$delta_tok")"
   pct_part=""
   if [ -n "$used_pct" ]; then
     ctx_bang=""
     [ "$ctx_urgent" = "1" ] && ctx_bang="!"
     pct_part=$(awk -v p="$used_pct" -v b="$ctx_bang" 'BEGIN{printf " %s%.0f%%", b, p+0}')
   fi
-  tok_display="${YELLOW}${tok_str} tok${RST}${DIM}(${extra# }${pct_part})${RST}"
+  # show in/out split so cost asymmetry (output 5x pricier) is visible
+  tok_display="${YELLOW}${tok_str} tok${RST}${DIM}(${tok_in_str}in/${tok_out_str}out${extra}${pct_part})${RST}"
   parts+=("$tok_display")
 fi
 
@@ -312,9 +359,7 @@ if [ -n "$top_tool" ] && [ "$top_bytes" -gt 0 ] 2>/dev/null; then
   t_tok=$(format_tokens $(( top_bytes / 4 )))
   share_part=""
   [ "${top_share:-0}" -gt 0 ] 2>/dev/null && share_part="/${top_share}%"
-  extra_top=""
-  [ "$delta_top" -gt 0 ] 2>/dev/null && extra_top=" ${DIM}($(format_delta "$delta_top"))${RST}"
-  parts+=("${MAGENTA}⬆${top_tool} ${t_tok}${share_part}${RST}${extra_top}")
+  parts+=("${MAGENTA}top:${top_tool} ${t_tok}${share_part}${RST}")
 fi
 
 if [ -n "$cost_usd" ] && [ "$cost_usd" != "0" ] && [ "$cost_usd" != "0.0" ]; then
@@ -338,5 +383,10 @@ for part in "${parts[@]}"; do
     result="${result} ${SEP_CHAR} ${part}"
   fi
 done
+
+# turn counter as a tight prefix — no separator, just "7 " before everything
+if [ "${user_turns:-0}" -gt 0 ] 2>/dev/null; then
+  result="${DIM}${user_turns}${RST} ${result}"
+fi
 
 printf '%s\n' "$result"
