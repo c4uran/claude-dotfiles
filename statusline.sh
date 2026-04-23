@@ -226,11 +226,12 @@ if [ "$_do_upd" = "1" ]; then
       elif command -v gtimeout >/dev/null 2>&1; then gtimeout 15 git "$@"
       else git "$@"; fi
     }
-    _tgit -C "$_dotfiles" fetch --quiet origin master 2>/dev/null || exit 0
+    _branch=$(git -C "$_dotfiles" symbolic-ref --short HEAD 2>/dev/null) || exit 0
+    _tgit -C "$_dotfiles" fetch --quiet origin "$_branch" 2>/dev/null || exit 0
     _loc=$(git -C "$_dotfiles" rev-parse HEAD 2>/dev/null)
-    _rem=$(git -C "$_dotfiles" rev-parse origin/master 2>/dev/null)
+    _rem=$(git -C "$_dotfiles" rev-parse "origin/$_branch" 2>/dev/null)
     [ -n "$_loc" ] && [ -n "$_rem" ] && [ "$_loc" != "$_rem" ] && \
-      git -C "$_dotfiles" merge --ff-only --quiet origin/master 2>/dev/null
+      git -C "$_dotfiles" merge --ff-only --quiet "origin/$_branch" 2>/dev/null
   ) >/dev/null 2>&1 &
   disown $! 2>/dev/null || true
 fi
@@ -315,49 +316,14 @@ if [ "${total_tool_bytes:-0}" -gt 0 ] 2>/dev/null; then
   top_share=$(awk -v a="$top_bytes" -v b="$total_tool_bytes" 'BEGIN{printf "%.0f", (a/b)*100}')
 fi
 
-# --- static context file token estimate ---
-# Approximation: bytes / 4 across CLAUDE.md, all memory/*.md, and skills/*.md.
-# Uses cwd from JSON to locate the project CLAUDE.md.
-_ctx_bytes=0
-_ctx_claude_md="${cwd}/CLAUDE.md"
-# memory dir derived from cwd: /foo/bar/baz → project key -foo-bar-baz
-_ctx_memory_dir=""
-if [ -n "$cwd" ]; then
-  _proj_key=$(printf '%s' "$cwd" | tr '/' '-')
-  _ctx_memory_dir="$HOME/.claude/projects/${_proj_key}/memory"
-fi
-if [ -f "$_ctx_claude_md" ]; then
-  _sz=$(wc -c < "$_ctx_claude_md" 2>/dev/null | tr -d '[:space:]')
-  _ctx_bytes=$(( _ctx_bytes + ${_sz:-0} ))
-fi
-# all memory files are loaded into context, not just MEMORY.md
-if [ -n "$_ctx_memory_dir" ] && [ -d "$_ctx_memory_dir" ]; then
-  _mem_total=$(cat "$_ctx_memory_dir"/*.md 2>/dev/null | wc -c | tr -d '[:space:]')
-  _ctx_bytes=$(( _ctx_bytes + ${_mem_total:-0} ))
-fi
-# skills: only names+descriptions are auto-injected, not full files (~150 bytes each)
-_skill_count=$(ls "$HOME/.claude/skills/"*.md 2>/dev/null | wc -l | tr -d '[:space:]')
-_ctx_bytes=$(( _ctx_bytes + ${_skill_count:-0} * 150 ))
-# token estimate from measurable files only — no guessing system prompt / tool schemas
-_ctx_tok=$(( _ctx_bytes / 4 ))
-_ctx_tok_str=""
-if [ "$_ctx_tok" -gt 0 ] 2>/dev/null; then
-  _ctx_tok_str=$(awk -v n="$_ctx_tok" 'BEGIN{
-    if (n >= 1000000)   printf "f~%.1fM", n/1000000
-    else if (n >= 1000) printf "f~%.1fk", n/1000
-    else                printf "f~%d", n
-  }')
-fi
 
 # --- assemble line ---
 parts=()
 
-# Compact model: "Sonnet 4.6" → "S4.6", "Opus 4.7" → "O4.7", "Haiku 4.5" → "H4.5"
+# Compact model: first letter + version number — works for any future model family
 model_abbr=$(printf '%s' "$model_short" | awk '{
-  if      ($1=="Sonnet") printf "S%s", $2
-  else if ($1=="Opus")   printf "O%s", $2
-  else if ($1=="Haiku")  printf "H%s", $2
-  else                   print $0
+  if (NF >= 2) printf "%s%s", substr($1,1,1), $2
+  else          print $0
 }')
 
 # model + dir + branch as one compact field: "S4.6 infra@main"
@@ -366,7 +332,6 @@ _header="${dir_name}"
 [ -n "$model_abbr" ] && _header="${CYAN}${model_abbr}${RST} ${BOLD}${_header}"
 parts+=("${_header}${RST}")
 
-[ -n "$_ctx_tok_str" ] && parts+=("${DIM}${_ctx_tok_str}${RST}")
 
 # s:N = interactive sessions machine-wide; ag:N = subagents this session / sys total
 _other_agents=$(( total_sys_agents - sess_agents ))
@@ -384,8 +349,7 @@ if [ "$tok_raw" -gt 0 ] 2>/dev/null; then
     [ "$ctx_urgent" = "1" ] && ctx_bang="!"
     pct_part=$(awk -v p="$used_pct" -v b="$ctx_bang" 'BEGIN{printf " %s%.0f%%", b, p+0}')
   fi
-  # show in/out split so cost asymmetry (output 5x pricier) is visible
-  tok_display="${YELLOW}${tok_str} tok${RST}${DIM}(↑${tok_in_str}/↓${tok_out_str}${extra}${pct_part})${RST}"
+  tok_display="${YELLOW}↑${tok_in_str}/↓${tok_out_str}${RST}${DIM}(${extra# }${pct_part})${RST}"
   parts+=("$tok_display")
 fi
 
@@ -395,9 +359,8 @@ fi
 
 if [ -n "$top_tool" ] && [ "$top_bytes" -gt 0 ] 2>/dev/null; then
   _t1=$(abbrev_tool "$top_tool")
-  _t1_share=$(awk -v a="$top_bytes" -v b="$total_tool_bytes" \
-    'BEGIN{printf "%.0f", (b>0)?(a/b)*100:0}')
-  _t1_str="${_t1}×${top_calls}/${_t1_share}%"
+  _t1_tok=$(format_tokens $(( top_bytes / 4 )))
+  _t1_str="${_t1}×${top_calls} ${_t1_tok}"
 
   # show second tool if it holds >10% of tool bytes
   _t2_str=""
@@ -406,7 +369,8 @@ if [ -n "$top_tool" ] && [ "$top_bytes" -gt 0 ] 2>/dev/null; then
       'BEGIN{printf "%.0f", (b>0)?(a/b)*100:0}')
     if [ "$_t2_share" -ge 10 ] 2>/dev/null; then
       _t2=$(abbrev_tool "$top2_tool")
-      _t2_str=" ${_t2}×${top2_calls}/${_t2_share}%"
+      _t2_tok=$(format_tokens $(( top2_bytes / 4 )))
+      _t2_str=" ${_t2}×${top2_calls} ${_t2_tok}"
     fi
   fi
 
