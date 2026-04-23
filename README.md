@@ -51,7 +51,7 @@ Example (panic):
 | `+Δ` | tokens added this turn (always shown, `+0` if none) | large delta = this request is heavy |
 | `pct%` | context window fill | ≥80% → `!` → time to `/compact` |
 | `↓compact -Xk` | tokens freed by last `/compact` | visible for one turn only |
-| `tool×N/share%` | top tool: call count + share of all tool bytes | `×1/40%` = one huge call → use `limit`; `×40/40%` = frequency problem → reduce calls |
+| `tool×N/share%` | top tool by bytes: call count + share of tool traffic | `×1/40%` = one huge call → use `limit`; `×40/40%` = frequency problem → reduce calls |
 | second tool | shown only when its share ≥10% | two tools both large = distributed bottleneck |
 | `$X.XXXX` | total session cost | divide by N for average per request |
 | `(+$Δ)` | cost delta this turn | full price of this request |

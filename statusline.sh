@@ -410,7 +410,7 @@ if [ -n "$top_tool" ] && [ "$top_bytes" -gt 0 ] 2>/dev/null; then
     fi
   fi
 
-  parts+=("${MAGENTA}top:${_t1_str}${_t2_str}${RST}")
+  parts+=("${MAGENTA}${_t1_str}${_t2_str}${RST}")
 fi
 
 if [ -n "$cost_usd" ] && [ "$cost_usd" != "0" ] && [ "$cost_usd" != "0.0" ]; then
