@@ -291,29 +291,30 @@ if [ "${total_tool_bytes:-0}" -gt 0 ] 2>/dev/null; then
 fi
 
 # --- static context file token estimate ---
-# Approximation: bytes / 4 across CLAUDE.md, MEMORY.md, and skills/*.md.
+# Approximation: bytes / 4 across CLAUDE.md, all memory/*.md, and skills/*.md.
 # Uses cwd from JSON to locate the project CLAUDE.md.
 _ctx_bytes=0
 _ctx_claude_md="${cwd}/CLAUDE.md"
-# MEMORY.md path derived from cwd: /foo/bar/baz → project key -foo-bar-baz
-_ctx_memory_md=""
+# memory dir derived from cwd: /foo/bar/baz → project key -foo-bar-baz
+_ctx_memory_dir=""
 if [ -n "$cwd" ]; then
   _proj_key=$(printf '%s' "$cwd" | tr '/' '-')
-  _ctx_memory_md="$HOME/.claude/projects/${_proj_key}/memory/MEMORY.md"
+  _ctx_memory_dir="$HOME/.claude/projects/${_proj_key}/memory"
 fi
 if [ -f "$_ctx_claude_md" ]; then
   _sz=$(wc -c < "$_ctx_claude_md" 2>/dev/null | tr -d '[:space:]')
   _ctx_bytes=$(( _ctx_bytes + ${_sz:-0} ))
 fi
-if [ -n "$_ctx_memory_md" ] && [ -f "$_ctx_memory_md" ]; then
-  _sz=$(wc -c < "$_ctx_memory_md" 2>/dev/null | tr -d '[:space:]')
-  _ctx_bytes=$(( _ctx_bytes + ${_sz:-0} ))
+# all memory files are loaded into context, not just MEMORY.md
+if [ -n "$_ctx_memory_dir" ] && [ -d "$_ctx_memory_dir" ]; then
+  _mem_total=$(cat "$_ctx_memory_dir"/*.md 2>/dev/null | wc -c | tr -d '[:space:]')
+  _ctx_bytes=$(( _ctx_bytes + ${_mem_total:-0} ))
 fi
 # skills: only names+descriptions are auto-injected, not full files (~150 bytes each)
 _skill_count=$(ls "$HOME/.claude/skills/"*.md 2>/dev/null | wc -l | tr -d '[:space:]')
 _ctx_bytes=$(( _ctx_bytes + ${_skill_count:-0} * 150 ))
-# add ~6k tok constant for system prompt + tool schemas overhead
-_ctx_tok=$(( _ctx_bytes / 4 + 6000 ))
+# token estimate from measurable files only — no guessing system prompt / tool schemas
+_ctx_tok=$(( _ctx_bytes / 4 ))
 _ctx_tok_str=""
 if [ "$_ctx_tok" -gt 0 ] 2>/dev/null; then
   _ctx_tok_str=$(awk -v n="$_ctx_tok" 'BEGIN{
