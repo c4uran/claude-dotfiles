@@ -333,9 +333,9 @@ _ctx_tok=$(( _ctx_bytes / 4 ))
 _ctx_tok_str=""
 if [ "$_ctx_tok" -gt 0 ] 2>/dev/null; then
   _ctx_tok_str=$(awk -v n="$_ctx_tok" 'BEGIN{
-    if (n >= 1000000)   printf "files ~%.1fM tok", n/1000000
-    else if (n >= 1000) printf "files ~%.1fk tok", n/1000
-    else                printf "files ~%d tok", n
+    if (n >= 1000000)   printf "f~%.1fM", n/1000000
+    else if (n >= 1000) printf "f~%.1fk", n/1000
+    else                printf "f~%d", n
   }')
 fi
 
@@ -375,7 +375,7 @@ if [ "$tok_raw" -gt 0 ] 2>/dev/null; then
     pct_part=$(awk -v p="$used_pct" -v b="$ctx_bang" 'BEGIN{printf " %s%.0f%%", b, p+0}')
   fi
   # show in/out split so cost asymmetry (output 5x pricier) is visible
-  tok_display="${YELLOW}${tok_str} tok${RST}${DIM}(${tok_in_str}in/${tok_out_str}out${extra}${pct_part})${RST}"
+  tok_display="${YELLOW}${tok_str} tok${RST}${DIM}(↑${tok_in_str}/↓${tok_out_str}${extra}${pct_part})${RST}"
   parts+=("$tok_display")
 fi
 
