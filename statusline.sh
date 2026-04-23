@@ -3,7 +3,7 @@
 # Claude Code diagnostic status line.
 #
 # Format:
-#   N model dir@branch | static ~Xk tok | s:N ag:N | Xk tok(in/out +Δ [!]pct%) | top:tool Xk/share% | $cost(+Δ[!])
+#   N model dir@branch | files ~Xk tok | s:N ag:N | Xk tok(in/out +Δ [!]pct%) | top:tool Xk/share% | $cost(+Δ[!])
 #
 # The line is intentionally dense: every field carries a signal you can
 # diagnose at a glance (or paste to another Claude and it can diagnose it
@@ -318,9 +318,9 @@ _ctx_tok=$(( _ctx_bytes / 4 ))
 _ctx_tok_str=""
 if [ "$_ctx_tok" -gt 0 ] 2>/dev/null; then
   _ctx_tok_str=$(awk -v n="$_ctx_tok" 'BEGIN{
-    if (n >= 1000000)   printf "static ~%.1fM tok", n/1000000
-    else if (n >= 1000) printf "static ~%.1fk tok", n/1000
-    else                printf "static ~%d tok", n
+    if (n >= 1000000)   printf "files ~%.1fM tok", n/1000000
+    else if (n >= 1000) printf "files ~%.1fk tok", n/1000
+    else                printf "files ~%d tok", n
   }')
 fi
 
