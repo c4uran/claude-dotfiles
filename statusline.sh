@@ -3,7 +3,7 @@
 # Claude Code diagnostic status line.
 #
 # Format:
-#   N model dir@branch | files ~Xk tok | s:N ag:N | Xk tok(in/out +Δ [!]pct%) | top:tool Xk/share% | $cost(+Δ[!])
+#   N sessions:model:[!]week% dir@branch | Xk tok(in/out +Δ [!]pct%) | top:tool Xk/share%
 #
 # The line is intentionally dense: every field carries a signal you can
 # diagnose at a glance (or paste to another Claude and it can diagnose it
@@ -14,14 +14,10 @@
 #
 # Tunable thresholds (env vars):
 #   CLAUDE_ADVISE_CTX_PCT       context %age that gets flagged with '!'   (default 80)
-#   CLAUDE_ADVISE_COST_RATIO    (this turn Δcost / avg prior Δcost) to flag (default 2.5)
-#   CLAUDE_ADVISE_COST_FLOOR    minimum Δcost USD for spike flag          (default 0.10)
 
 input=$(cat)
 
 CLAUDE_ADVISE_CTX_PCT="${CLAUDE_ADVISE_CTX_PCT:-80}"
-CLAUDE_ADVISE_COST_RATIO="${CLAUDE_ADVISE_COST_RATIO:-2.5}"
-CLAUDE_ADVISE_COST_FLOOR="${CLAUDE_ADVISE_COST_FLOOR:-0.10}"
 
 # --- colors (dim palette, safe on most terminals) ---
 if [ -t 1 ] || [ -n "${COLORTERM:-}" ] || [ "${TERM:-dumb}" != "dumb" ]; then
@@ -48,6 +44,7 @@ SEP_CHAR="${SEP}|${RST}"
   read -r cost_usd
   read -r transcript
   read -r session_id
+  read -r week_pct
 } < <(printf '%s' "$input" | jq -r '
   .model.display_name // .model.id // "",
   .workspace.current_dir // .cwd // "",
@@ -56,7 +53,8 @@ SEP_CHAR="${SEP}|${RST}"
   .context_window.used_percentage // "",
   .cost.total_cost_usd // "",
   .transcript_path // "",
-  .session_id // ""
+  .session_id // "",
+  (.rate_limits.seven_day.used_percentage // "")
 ' 2>/dev/null)
 
 # --- model / dir / git branch ---
@@ -162,43 +160,17 @@ fi
 : "${top_bytes:=0}"
 : "${total_tool_bytes:=0}"
 
-# --- process counts: sessions · system agents · session agents ---
-# Subagents are identified by --input-format stream-json flag (never set on interactive sessions).
+# --- process counts: interactive sessions machine-wide ---
 # Portable: awk strips leading path so /usr/bin/claude and claude both match.
-_proc_counts=$(ps -eo args 2>/dev/null | awk '
+# Subagents (--input-format stream-json) are excluded from this count.
+total_sessions=$(ps -eo args 2>/dev/null | awk '
   {
     b = $1; sub(/.*\//, "", b)
-    if (b == "claude") {
-      if (/--input-format[[:space:]]stream-json/) sys_ag++
-      else sess++
-    }
+    if (b == "claude" && !/--input-format[[:space:]]stream-json/) sess++
   }
-  END { printf "%d %d", sess+0, sys_ag+0 }
+  END { print sess+0 }
 ')
-total_sessions=$(printf '%s' "$_proc_counts" | awk '{print $1+0}')
-total_sys_agents=$(printf '%s' "$_proc_counts" | awk '{print $2+0}')
-
-# Walk up PPID chain to find the ancestor claude PID (max 5 hops).
-# The statusline is spawned as: claude → bash statusline.sh, so PPID is usually claude.
-_walk=$PPID; _parent_claude=""; _depth=0
-while [ "$_depth" -lt 5 ]; do
-  _w=$(printf '%s' "${_walk:-}" | tr -d '[:space:]')
-  case "$_w" in ''|0|1) break ;; esac
-  _wcomm=$(ps -o comm= -p "$_w" 2>/dev/null | tr -d '[:space:]')
-  if [ "$_wcomm" = "claude" ]; then
-    _parent_claude=$_w; break
-  fi
-  _walk=$(ps -o ppid= -p "$_w" 2>/dev/null)
-  _depth=$(( _depth + 1 ))
-done
-
-sess_agents=0
-if [ -n "$_parent_claude" ]; then
-  sess_agents=$(ps -eo ppid,args 2>/dev/null | awk -v p="$_parent_claude" \
-    '$1+0==p+0 && /--input-format[[:space:]]stream-json/{c++} END{print c+0}')
-fi
 : "${total_sessions:=0}"
-: "${total_sys_agents:=0}"
 
 # --- per-turn delta: baseline snapshots at the start of each user turn ---
 state_dir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-statusline"
@@ -283,27 +255,6 @@ delta_tok=$(( tok_raw - _base_tok ))
 [ "$delta_tok" -lt 0 ] && delta_tok=0
 # delta_top removed: misleads when top tool changes between turns
 
-# Cost delta & outlier detection (float math → awk).
-# delta_cost = current - base_cost (0 if missing)
-# avg_prior_cost_per_turn = base_cost / max(base_turns - 1, 1)
-# spike = (base_turns > 1) && (delta_cost > FLOOR) && (delta_cost > RATIO * avg)
-read -r delta_cost cost_spike <<EOF
-$(awk -v c="${cost_usd:-0}" -v b="${base_cost:-0}" \
-       -v bt="${base_turns:-0}" -v r="$CLAUDE_ADVISE_COST_RATIO" \
-       -v f="$CLAUDE_ADVISE_COST_FLOOR" 'BEGIN{
-  d = (c+0) - (b+0); if (d<0) d=0
-  spike = 0
-  if ((bt+0) > 1) {
-    prior_turns = (bt+0) - 1
-    avg = (b+0) / prior_turns
-    if (d > (f+0) && d > (r+0) * avg) spike = 1
-  }
-  printf "%.6f %d", d, spike
-}')
-EOF
-: "${delta_cost:=0}"
-: "${cost_spike:=0}"
-
 # Context urgency flag
 ctx_urgent=0
 if [ -n "$used_pct" ]; then
@@ -326,19 +277,17 @@ model_abbr=$(printf '%s' "$model_short" | awk '{
   else          print $0
 }')
 
-# model + dir + branch as one compact field: "S4.6 infra@main"
+# sessions:model[:week%] + dir + branch as one compact field: "4:S4.6:44% infra@main"
 _header="${dir_name}"
 [ -n "$branch" ] && _header="${_header}${GREEN}@${branch}${RST}"
-[ -n "$model_abbr" ] && _header="${CYAN}${model_abbr}${RST} ${BOLD}${_header}"
+_model_part="${model_abbr}"
+if [ -n "$week_pct" ]; then
+  week_bang=""
+  [ "$(awk -v p="$week_pct" 'BEGIN{print (p+0 >= 80) ? 1 : 0}')" = "1" ] && week_bang="!"
+  _model_part="${_model_part}:${week_bang}$(awk -v p="$week_pct" 'BEGIN{printf "%.0f", p+0}')%"
+fi
+[ -n "$model_abbr" ] && _header="${DIM}${total_sessions}:${RST}${CYAN}${_model_part}${RST} ${BOLD}${_header}"
 parts+=("${_header}${RST}")
-
-
-# s:N = interactive sessions machine-wide; ag:N = subagents this session / sys total
-_other_agents=$(( total_sys_agents - sess_agents ))
-[ "$_other_agents" -lt 0 ] && _other_agents=0
-_ag_str="ag:${sess_agents}"
-[ "$_other_agents" -gt 0 ] && _ag_str="${_ag_str}(+${_other_agents} other)"
-parts+=("${DIM}s:${total_sessions} ${_ag_str}${RST}")
 
 if [ "$tok_raw" -gt 0 ] 2>/dev/null; then
   # always show delta so +0 is explicit (vs missing = ambiguous)
@@ -375,18 +324,6 @@ if [ -n "$top_tool" ] && [ "$top_bytes" -gt 0 ] 2>/dev/null; then
   fi
 
   parts+=("${MAGENTA}${_t1_str}${_t2_str}${RST}")
-fi
-
-if [ -n "$cost_usd" ] && [ "$cost_usd" != "0" ] && [ "$cost_usd" != "0.0" ]; then
-  cost_fmt=$(awk -v c="$cost_usd" 'BEGIN{printf "$%.4f", c+0}')
-  cost_extra=""
-  if [ "$(awk -v d="$delta_cost" 'BEGIN{print (d+0 > 0.0001) ? 1 : 0}')" = "1" ]; then
-    bang=""
-    [ "$cost_spike" = "1" ] && bang="!"
-    cost_extra=$(awk -v d="$delta_cost" -v b="$bang" 'BEGIN{printf "(%s+$%.4f)", b, d}')
-    cost_extra=" ${DIM}${cost_extra}${RST}"
-  fi
-  parts+=("${MAGENTA}${cost_fmt}${RST}${cost_extra}")
 fi
 
 result=""
