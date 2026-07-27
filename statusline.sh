@@ -29,8 +29,9 @@ if [ -t 1 ] || [ -n "${COLORTERM:-}" ] || [ "${TERM:-dumb}" != "dumb" ]; then
   GREEN=$'\033[32m'
   YELLOW=$'\033[33m'
   MAGENTA=$'\033[35m'
+  RED=$'\033[31m'
 else
-  SEP="" RST="" BOLD="" DIM="" CYAN="" GREEN="" YELLOW="" MAGENTA=""
+  SEP="" RST="" BOLD="" DIM="" CYAN="" GREEN="" YELLOW="" MAGENTA="" RED=""
 fi
 SEP_CHAR="${SEP}|${RST}"
 
@@ -45,6 +46,7 @@ SEP_CHAR="${SEP}|${RST}"
   read -r transcript
   read -r session_id
   read -r week_pct
+  read -r week_reset
 } < <(printf '%s' "$input" | jq -r '
   .model.display_name // .model.id // "",
   .workspace.current_dir // .cwd // "",
@@ -54,7 +56,8 @@ SEP_CHAR="${SEP}|${RST}"
   .cost.total_cost_usd // "",
   .transcript_path // "",
   .session_id // "",
-  (.rate_limits.seven_day.used_percentage // "")
+  (.rate_limits.seven_day.used_percentage // ""),
+  (.rate_limits.seven_day.resets_at // "")
 ' 2>/dev/null)
 
 # --- model / dir / git branch ---
@@ -255,6 +258,26 @@ delta_tok=$(( tok_raw - _base_tok ))
 [ "$delta_tok" -lt 0 ] && delta_tok=0
 # delta_top removed: misleads when top tool changes between turns
 
+# --- weekly pace ("smart %"): headroom vs calendar, in units of ONE day's budget ---
+# The weekly allowance spread evenly = 100/7 pp per day. By now you "should" have
+# spent elapsed_fraction * 100. Positive => under pace (budget in hand), negative =>
+# overdrawn. Expressed as a % of a single day's share, so +100% == a whole day spare.
+smart_pct=""
+smart_neg=0
+if [ -n "$week_pct" ] && [ -n "$week_reset" ]; then
+  read -r smart_pct smart_neg <<EOF
+$(awk -v used="$week_pct" -v reset="$week_reset" -v now="$(date +%s 2>/dev/null)" 'BEGIN{
+  wk = 604800
+  start = (reset+0) - wk
+  if (now+0 <= start || now+0 >= reset+0) exit          # stale/absent reset -> no verdict
+  spent_share = ((now+0) - start) / wk * 100
+  headroom    = spent_share - (used+0)
+  printf "%+.0f %d", headroom / (100/7) * 100, (headroom < 0) ? 1 : 0
+}')
+EOF
+fi
+: "${smart_neg:=0}"
+
 # Context urgency flag
 ctx_urgent=0
 if [ -n "$used_pct" ]; then
@@ -277,16 +300,22 @@ model_abbr=$(printf '%s' "$model_short" | awk '{
   else          print $0
 }')
 
-# sessions:model[:week%] + dir + branch as one compact field: "4:S4.6:44% infra@main"
+# sessions:model[:week%][·pace%] + dir + branch: "4:S4.6:44%·+35% infra@main"
 _header="${dir_name}"
 [ -n "$branch" ] && _header="${_header}${GREEN}@${branch}${RST}"
-_model_part="${model_abbr}"
+_model_part="${CYAN}${model_abbr}"
 if [ -n "$week_pct" ]; then
   week_bang=""
   [ "$(awk -v p="$week_pct" 'BEGIN{print (p+0 >= 80) ? 1 : 0}')" = "1" ] && week_bang="!"
   _model_part="${_model_part}:${week_bang}$(awk -v p="$week_pct" 'BEGIN{printf "%.0f", p+0}')%"
 fi
-[ -n "$model_abbr" ] && _header="${DIM}${total_sessions}:${RST}${CYAN}${_model_part}${RST} ${BOLD}${_header}"
+_model_part="${_model_part}${RST}"
+if [ -n "$smart_pct" ]; then
+  pace_col="$GREEN"
+  [ "$smart_neg" = "1" ] && pace_col="$RED"
+  _model_part="${_model_part}${DIM}·${RST}${pace_col}${smart_pct}%${RST}"
+fi
+[ -n "$model_abbr" ] && _header="${DIM}${total_sessions}:${RST}${_model_part} ${BOLD}${_header}"
 parts+=("${_header}${RST}")
 
 if [ "$tok_raw" -gt 0 ] 2>/dev/null; then
