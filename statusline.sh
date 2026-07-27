@@ -272,7 +272,8 @@ $(awk -v used="$week_pct" -v reset="$week_reset" -v now="$(date +%s 2>/dev/null)
   if (now+0 <= start || now+0 >= reset+0) exit          # stale/absent reset -> no verdict
   spent_share = ((now+0) - start) / wk * 100
   headroom    = spent_share - (used+0)
-  printf "%+.0f %d", headroom / (100/7) * 100, (headroom < 0) ? 1 : 0
+  v = headroom / (100/7) * 100                          # in units of one daily share
+  printf "%.0f %d", (v < 0) ? -v : v, (headroom < 0) ? 1 : 0
 }')
 EOF
 fi
@@ -300,20 +301,23 @@ model_abbr=$(printf '%s' "$model_short" | awk '{
   else          print $0
 }')
 
-# sessions:model[:week%][·pace%] + dir + branch: "4:S4.6:44%·+35% infra@main"
+# sessions:model:pace%/week% + dir + branch: "4:S4.6:30%/48% infra@main"
+# pace% carries its verdict in colour alone (green = budget in hand, red = overdrawn),
+# so it prints unsigned; week% is the raw weekly consumption.
 _header="${dir_name}"
 [ -n "$branch" ] && _header="${_header}${GREEN}@${branch}${RST}"
-_model_part="${CYAN}${model_abbr}"
+_model_part="${CYAN}${model_abbr}${RST}"
 if [ -n "$week_pct" ]; then
   week_bang=""
   [ "$(awk -v p="$week_pct" 'BEGIN{print (p+0 >= 80) ? 1 : 0}')" = "1" ] && week_bang="!"
-  _model_part="${_model_part}:${week_bang}$(awk -v p="$week_pct" 'BEGIN{printf "%.0f", p+0}')%"
-fi
-_model_part="${_model_part}${RST}"
-if [ -n "$smart_pct" ]; then
-  pace_col="$GREEN"
-  [ "$smart_neg" = "1" ] && pace_col="$RED"
-  _model_part="${_model_part}${DIM}·${RST}${pace_col}${smart_pct}%${RST}"
+  _wk=$(awk -v p="$week_pct" 'BEGIN{printf "%.0f", p+0}')
+  if [ -n "$smart_pct" ]; then
+    pace_col="$GREEN"
+    [ "$smart_neg" = "1" ] && pace_col="$RED"
+    _model_part="${_model_part}${CYAN}:${RST}${pace_col}${smart_pct}%${RST}${DIM}/${RST}${CYAN}${week_bang}${_wk}%${RST}"
+  else
+    _model_part="${_model_part}${CYAN}:${week_bang}${_wk}%${RST}"
+  fi
 fi
 [ -n "$model_abbr" ] && _header="${DIM}${total_sessions}:${RST}${_model_part} ${BOLD}${_header}"
 parts+=("${_header}${RST}")
