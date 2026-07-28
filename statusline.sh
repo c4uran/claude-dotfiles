@@ -47,6 +47,11 @@ SEP_CHAR="${SEP}|${RST}"
   read -r session_id
   read -r week_pct
   read -r week_reset
+  read -r model_id
+  read -r cu_input
+  read -r cu_cache_write
+  read -r cu_cache_read
+  read -r cu_output
 } < <(printf '%s' "$input" | jq -r '
   .model.display_name // .model.id // "",
   .workspace.current_dir // .cwd // "",
@@ -57,7 +62,12 @@ SEP_CHAR="${SEP}|${RST}"
   .transcript_path // "",
   .session_id // "",
   (.rate_limits.seven_day.used_percentage // ""),
-  (.rate_limits.seven_day.resets_at // "")
+  (.rate_limits.seven_day.resets_at // ""),
+  .model.id // "",
+  (.context_window.current_usage.input_tokens // 0 | tostring),
+  (.context_window.current_usage.cache_creation_input_tokens // 0 | tostring),
+  (.context_window.current_usage.cache_read_input_tokens // 0 | tostring),
+  (.context_window.current_usage.output_tokens // 0 | tostring)
 ' 2>/dev/null)
 
 # --- model / dir / git branch ---
@@ -97,6 +107,38 @@ format_delta() {
 tok_str=$(format_tokens "$tok_raw")
 tok_in_str=$(format_tokens "$tok_in")
 tok_out_str=$(format_tokens "$tok_out")
+
+# --- per-turn cache-aware cost (last API call only, from context_window.current_usage) ---
+# `.cost.total_cost_usd` is session-cumulative and computed harness-side with the real
+# rates, but doesn't expose the cache split for THIS turn. current_usage does — but only
+# as a FLAT cache_creation_input_tokens; the CLI's statusLine JSON does NOT break it into
+# ephemeral_5m/ephemeral_1h (verified empirically against a live payload — earlier attempt
+# assumed a nested breakdown that doesn't exist here, which silently zeroed the write
+# bucket and made the cache-read% meaningless — always ~100% since writes never counted).
+# We can't tell 5m from 1h writes from this JSON alone, so we price the whole write bucket
+# at the 1h rate (this harness's sessions run 1h TTL per client-harness bus_emit config —
+# an approximation, not exact, if a call actually used 5m). Rates per-Mtok USD; keep in
+# sync with anthropic.com/pricing. Sonnet 5 is on promo through 2026-08-31 (in $2/out $10;
+# reverts to $3/$15 after).
+price_for_model() { # model_id model_display -> "in out write read" (1h write rate; empty = unknown)
+  case "$1$2" in
+    *sonnet-5*|*[Ss]onnet\ 5*)   printf '2 10 4 0.2' ;;
+    *opus-5*|*[Oo]pus\ 5*)       printf '5 25 10 0.5' ;;
+    *haiku-4-5*|*[Hh]aiku\ 4.5*) printf '1 5 2 0.1' ;;
+    *) printf '' ;;
+  esac
+}
+
+turn_cost=""
+read -r _p_in _p_out _p_wr _p_rd <<EOF
+$(price_for_model "$model_id" "$model_short")
+EOF
+if [ -n "${_p_in:-}" ]; then
+  turn_cost=$(awk -v a="${cu_input:-0}" -v b="${cu_output:-0}" -v c="${cu_cache_write:-0}" \
+    -v e="${cu_cache_read:-0}" \
+    -v pi="$_p_in" -v po="$_p_out" -v pw="$_p_wr" -v pr="$_p_rd" \
+    'BEGIN{ n=a+b+c+e; if (n<=0) exit; cost=(a*pi+b*po+c*pw+e*pr)/1000000; printf "%.4f", cost }')
+fi
 
 # --- transcript parsing: user-turn count + top tool by bytes ---
 # (transcript and session_id already parsed above)
@@ -216,6 +258,11 @@ base_tok=""
 base_cost=""
 compacted=0
 compact_saved=0
+cum_input=0
+cum_write=0
+cum_read=0
+cum_output=0
+last_fp=""
 if [ -n "$session_id" ]; then
   state_file="$state_dir/$session_id.state"
   if [ -r "$state_file" ]; then
@@ -226,11 +273,19 @@ if [ -n "$session_id" ]; then
         cost)          base_cost=$v ;;
         compacted)     compacted=$v ;;
         compact_saved) compact_saved=$v ;;
+        cum_input)     cum_input=$v ;;
+        cum_write)     cum_write=$v ;;
+        cum_read)      cum_read=$v ;;
+        cum_output)    cum_output=$v ;;
+        last_fp)       last_fp=$v ;;
       esac
     done < "$state_file"
   fi
+  : "${cum_input:=0}" "${cum_write:=0}" "${cum_read:=0}" "${cum_output:=0}"
 
-  # Promote baseline on first run OR when a new user turn has appeared.
+  state_dirty=0
+
+  # Promote turn baseline on first run OR when a new user turn has appeared.
   if [ -z "$base_turns" ] || [ "$user_turns" != "$base_turns" ]; then
     # Detect compact: tok_raw dropped since last baseline
     new_compacted=0
@@ -239,17 +294,41 @@ if [ -n "$session_id" ]; then
       new_compacted=1
       new_saved=$(( base_tok - tok_raw ))
     fi
-    {
-      printf 'turns=%s\n'         "$user_turns"
-      printf 'tok=%s\n'           "$tok_raw"
-      printf 'cost=%s\n'          "${cost_usd:-0}"
-      printf 'compacted=%s\n'     "$new_compacted"
-      printf 'compact_saved=%s\n' "$new_saved"
-    } > "$state_file" 2>/dev/null
+    base_turns=$user_turns
     base_tok=$tok_raw
     base_cost=${cost_usd:-0}
     compacted=$new_compacted
     compact_saved=$new_saved
+    state_dirty=1
+  fi
+
+  # Accumulate THIS API call's cache split into a session-wide running total.
+  # current_usage is "last call only" — statusLine gets re-invoked many times
+  # between calls (idle refreshes), so dedupe via a fingerprint of the four
+  # counts: only add once per distinct call, not once per script invocation.
+  _fp="${cu_input:-0}:${cu_cache_write:-0}:${cu_cache_read:-0}:${cu_output:-0}"
+  if [ "$_fp" != "0:0:0:0" ] && [ "$_fp" != "$last_fp" ]; then
+    cum_input=$(( cum_input + ${cu_input:-0} ))
+    cum_write=$(( cum_write + ${cu_cache_write:-0} ))
+    cum_read=$(( cum_read + ${cu_cache_read:-0} ))
+    cum_output=$(( cum_output + ${cu_output:-0} ))
+    last_fp=$_fp
+    state_dirty=1
+  fi
+
+  if [ "$state_dirty" = "1" ]; then
+    {
+      printf 'turns=%s\n'         "$base_turns"
+      printf 'tok=%s\n'           "$base_tok"
+      printf 'cost=%s\n'          "$base_cost"
+      printf 'compacted=%s\n'     "$compacted"
+      printf 'compact_saved=%s\n' "$compact_saved"
+      printf 'cum_input=%s\n'     "$cum_input"
+      printf 'cum_write=%s\n'     "$cum_write"
+      printf 'cum_read=%s\n'      "$cum_read"
+      printf 'cum_output=%s\n'    "$cum_output"
+      printf 'last_fp=%s\n'       "$last_fp"
+    } > "$state_file" 2>/dev/null
   fi
 fi
 
@@ -325,14 +404,57 @@ parts+=("${_header}${RST}")
 if [ "$tok_raw" -gt 0 ] 2>/dev/null; then
   # always show delta so +0 is explicit (vs missing = ambiguous)
   extra=" $(format_delta "$delta_tok")"
-  pct_part=""
+  # --- segment 1: context-window occupancy (size, not cost — cache tokens still
+  # count against the window, so this must stay the gross total, unlabeled ctx% below
+  # is derived from the SAME total the CLI reports as used_percentage) ---
+  ctx_part=""
   if [ -n "$used_pct" ]; then
     ctx_bang=""
     [ "$ctx_urgent" = "1" ] && ctx_bang="!"
-    pct_part=$(awk -v p="$used_pct" -v b="$ctx_bang" 'BEGIN{printf " %s%.0f%%", b, p+0}')
+    ctx_part=$(awk -v p="$used_pct" -v b="$ctx_bang" 'BEGIN{printf " ctx:%s%.0f%%", b, p+0}')
   fi
-  tok_display="${YELLOW}↑${tok_in_str}/↓${tok_out_str}${RST}${DIM}(${extra# }${pct_part})${RST}"
+  tok_display="${YELLOW}↑${tok_in_str}/↓${tok_out_str}${RST}${DIM}(${extra# }${ctx_part})${RST}"
   parts+=("$tok_display")
+
+  # --- segment 2: cache efficiency (cost-relevant — "did the prefix survive").
+  # low % means the cacheable prefix got invalidated/expired and had to be paid for
+  # again (new input or cache-write) instead of a cheap cache-read. Denominator MUST
+  # include cache-write tokens or this silently inflates toward 100% whenever plain
+  # input_tokens is tiny, regardless of how much actually got rewritten this turn. ---
+  cache_pct=$(awk -v i="${cu_input:-0}" -v wr="${cu_cache_write:-0}" -v rd="${cu_cache_read:-0}" \
+    'BEGIN{ n=i+wr+rd; if (n<=0) exit; printf "%.0f", rd/n*100 }')
+  sess_cache_pct=$(awk -v i="${cum_input:-0}" -v wr="${cum_write:-0}" -v rd="${cum_read:-0}" \
+    'BEGIN{ n=i+wr+rd; if (n<=0) exit; printf "%.0f", rd/n*100 }')
+  if [ -n "$cache_pct" ] || [ -n "$sess_cache_pct" ]; then
+    cache_display="${DIM}cache:${RST}"
+    if [ -n "$cache_pct" ]; then
+      cache_col="$GREEN"
+      [ "$(awk -v p="$cache_pct" 'BEGIN{print (p+0 < 50) ? 1 : 0}')" = "1" ] && cache_col="$RED"
+      cache_display="${cache_display}${cache_col}${cache_pct}%${RST}"
+    fi
+    if [ -n "$sess_cache_pct" ]; then
+      sess_cache_col="$GREEN"
+      [ "$(awk -v p="$sess_cache_pct" 'BEGIN{print (p+0 < 50) ? 1 : 0}')" = "1" ] && sess_cache_col="$RED"
+      [ -n "$cache_pct" ] && cache_display="${cache_display}${DIM}/${RST}"
+      cache_display="${cache_display}${DIM}Σ${RST}${sess_cache_col}${sess_cache_pct}%${RST}"
+    fi
+    parts+=("$cache_display")
+  fi
+fi
+
+# --- segment 3: cost (turn = cache-aware self-priced; Σ = session-cumulative, harness-authoritative) ---
+if [ -n "$turn_cost" ] || { [ -n "$cost_usd" ] && [ "$cost_usd" != "0" ]; }; then
+  cost_display=""
+  [ -n "$turn_cost" ] && cost_display="\$${turn_cost}"
+  if [ -n "$cost_usd" ] && [ "$cost_usd" != "0" ]; then
+    _sess=$(awk -v c="$cost_usd" 'BEGIN{printf "%.2f", c+0}')
+    if [ -n "$cost_display" ]; then
+      cost_display="${cost_display} ${DIM}Σ\$${_sess}${RST}"
+    else
+      cost_display="Σ\$${_sess}"
+    fi
+  fi
+  parts+=("${MAGENTA}${cost_display}${RST}")
 fi
 
 if [ "${compacted:-0}" = "1" ] && [ "${compact_saved:-0}" -gt 0 ] 2>/dev/null; then
