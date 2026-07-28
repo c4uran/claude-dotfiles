@@ -120,23 +120,25 @@ tok_out_str=$(format_tokens "$tok_out")
 # an approximation, not exact, if a call actually used 5m). Rates per-Mtok USD; keep in
 # sync with anthropic.com/pricing. Sonnet 5 is on promo through 2026-08-31 (in $2/out $10;
 # reverts to $3/$15 after).
-price_for_model() { # model_id model_display -> "in out write read" (1h write rate; empty = unknown)
+price_for_model() { # model_id model_display -> "in out w5m w1h read" (empty = unknown)
   case "$1$2" in
-    *sonnet-5*|*[Ss]onnet\ 5*)   printf '2 10 4 0.2' ;;
-    *opus-5*|*[Oo]pus\ 5*)       printf '5 25 10 0.5' ;;
-    *haiku-4-5*|*[Hh]aiku\ 4.5*) printf '1 5 2 0.1' ;;
+    *sonnet-5*|*[Ss]onnet\ 5*)   printf '2 10 2.5 4 0.2' ;;
+    *opus-5*|*[Oo]pus\ 5*)       printf '5 25 6.25 10 0.5' ;;
+    *haiku-4-5*|*[Hh]aiku\ 4.5*) printf '1 5 1.25 2 0.1' ;;
     *) printf '' ;;
   esac
 }
 
 turn_cost=""
-read -r _p_in _p_out _p_wr _p_rd <<EOF
+read -r _p_in _p_out _p_w5 _p_w1 _p_rd <<EOF
 $(price_for_model "$model_id" "$model_short")
 EOF
 if [ -n "${_p_in:-}" ]; then
+  # main session's statusLine current_usage doesn't split write into 5m/1h (see
+  # note below where cu_cache_write is read) — whole write bucket priced at 1h.
   turn_cost=$(awk -v a="${cu_input:-0}" -v b="${cu_output:-0}" -v c="${cu_cache_write:-0}" \
     -v e="${cu_cache_read:-0}" \
-    -v pi="$_p_in" -v po="$_p_out" -v pw="$_p_wr" -v pr="$_p_rd" \
+    -v pi="$_p_in" -v po="$_p_out" -v pw="$_p_w1" -v pr="$_p_rd" \
     'BEGIN{ n=a+b+c+e; if (n<=0) exit; cost=(a*pi+b*po+c*pw+e*pr)/1000000; printf "%.4f", cost }')
 fi
 
@@ -159,11 +161,19 @@ top_tool="";  top_calls=0;  top_bytes=0
 top2_tool=""; top2_calls=0; top2_bytes=0
 total_tool_bytes=0
 
-# mcp__server__tool → server:tool, everything else unchanged
+# mcp__server__tool → server:tool, everything else unchanged. Plain index()/
+# substr() rather than 3-arg match(s, re, arr) — that's a gawk extension, not
+# POSIX, and breaks silently (falls through to raw tool names) under mawk,
+# which is what ships as /usr/bin/awk on Debian/Ubuntu (and this box).
 abbrev_tool() {
   printf '%s' "$1" | awk '{
-    if (match($0, /^mcp__([^_]+)__(.+)/, a)) printf "%s:%s", a[1], a[2]
-    else print $0
+    s = $0
+    if (index(s, "mcp__") == 1) {
+      rest = substr(s, 6)
+      p = index(rest, "__")
+      if (p > 0) { printf "%s:%s", substr(rest, 1, p-1), substr(rest, p+2); next }
+    }
+    print s
   }'
 }
 if [ -n "$transcript" ] && [ -f "$transcript" ]; then
@@ -204,6 +214,138 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
 fi
 : "${top_bytes:=0}"
 : "${total_tool_bytes:=0}"
+
+# --- sub-agent spend: real $ cost, grouped by ACTUAL model (single-letter label) ---
+# subagent_type (e.g. "tier-verify") only tells you which agent DEFINITION was
+# requested, not what model it really ran on — defaults/pins can differ from
+# what you'd guess by name (confirmed on this session's own two agents: both
+# spawned as claude-code-guide, which has no model pin and was expected to
+# inherit opus per a routing-hook nudge, but both actually ran on haiku). The
+# only source of truth is the sub-agent's OWN transcript, which the harness
+# keeps at <session-dir>/subagents/agent-<id>.jsonl — and unlike the main
+# session's statusLine JSON, ITS usage objects DO carry the real
+# cache_creation.ephemeral_5m/1h split, so cost here can be exact, not the
+# main segment's "assume 1h" approximation.
+#
+# current_usage above only covers THIS session's own API calls; a spawned
+# Agent burns tokens in its own separate conversation, which only surfaces
+# back here as a completion-notification/result blob — has to be scraped from
+# transcript text, not context_window.
+#
+# Correctness note: the naive approach (grep the whole transcript for every
+# "subagent_tokens" occurrence and sum) overcounts badly — a background agent's
+# task-notification can re-fire multiple times for the same completed run (harness
+# re-notifies while idle/unconsumed), so the same number appears repeatedly. Verified
+# on a real transcript: naive sum read 600k across 15 matches for what was actually
+# 2 agents / 73868 tokens. Must dedupe by the agent's own id before summing.
+sub_agent_count=0
+sub_agent_top=""; sub_agent_top_count=0; sub_agent_top_cost=""
+sub_agent_top2=""; sub_agent_top2_count=0; sub_agent_top2_cost=""
+if [ -n "$transcript" ] && [ -f "$transcript" ]; then
+  # Pass 1 (parsed JSON): map agent-id -> subagent_type, via the tool_use that
+  # launched it (has subagent_type) joined to its launch-ack tool_result (both
+  # sync and async launches always echo "agentId: <id>" in that first result).
+  # subagent_type is kept only as a fallback label if the per-agent transcript
+  # (and therefore the real model/cost) turns out to be unreadable/gone.
+  _sa_typemap=$(_run_jq -sc '
+    ([.[] | .message.content? | select(type=="array") | .[]]) as $all
+    | ($all | map(select(.type=="tool_use" and .name=="Agent") | {key:.id, value:(.input.subagent_type // "agent")}) | from_entries) as $tbt
+    | ($all | map(select(.type=="tool_result" and ($tbt[.tool_use_id // ""] != null))
+        | {tool_use_id, text: (.content | tostring)})) as $launches
+    | ($launches | map(
+        (.text | capture("agentId: (?<id>[a-f0-9]+)").id // null) as $aid
+        | select($aid != null)
+        | {key: $aid, value: $tbt[.tool_use_id]}
+      ) | from_entries) // {}
+  ' "$transcript" 2>/dev/null)
+  [ -z "$_sa_typemap" ] && _sa_typemap='{}'
+
+  # Pass 2 (raw text): every distinct agent-id that completed, deduped (same
+  # dedup reasoning as above — only need the id here now, cost comes from the
+  # agent's own transcript in pass 3, not from the notification text's token
+  # count, which was already just a blended total anyway).
+  _sa_ids=$(_run_jq -Rsr '
+    [ scan("<task-id>([a-f0-9]+)</task-id>"), scan("agentId: ([a-f0-9]+) \\(") ]
+    | map(.[0]) | unique | .[]
+  ' "$transcript" 2>/dev/null)
+
+  # claude-haiku-4-5-20251001 -> H (family initial only, no version — the
+  # session already shows its own model+version up front; this segment is
+  # meant to answer "roughly what tier, and how much", not restate a version).
+  _abbrev_model_id() { printf '%s' "$1" | awk -F'-' '{print toupper(substr($2,1,1))}'; }
+  _abbrev_type()      { printf '%s' "$1" | awk -F'-' '{print toupper(substr($1,1,1))}'; }
+
+  _sa_grouped=""
+  if [ -n "$_sa_ids" ]; then
+    _sa_dir="$(dirname "$transcript")/${session_id}/subagents"
+    while IFS= read -r _id; do
+      [ -n "$_id" ] || continue
+      _sub_transcript="$_sa_dir/agent-${_id}.jsonl"
+      [ -f "$_sub_transcript" ] || continue
+
+      # One pass over the agent's OWN transcript: real model + real per-tier
+      # usage sums (this is a full read, not head-bounded, since cost needs
+      # every turn's usage, not just the first — these files are a single
+      # agent's own conversation, not the whole session, so still small).
+      _sa_usage=$(_run_jq -sr '
+        [.[] | select(.message.model and .message.usage)] as $turns
+        | ($turns | map(.message.model) | first // "") as $model
+        | ($turns | map(.message.usage)) as $u
+        | "\($model) \($u | map(.input_tokens // 0) | add // 0) \($u | map(.output_tokens // 0) | add // 0) \($u | map(.cache_creation.ephemeral_5m_input_tokens // 0) | add // 0) \($u | map(.cache_creation.ephemeral_1h_input_tokens // 0) | add // 0) \($u | map(.cache_read_input_tokens // 0) | add // 0)"
+      ' "$_sub_transcript" 2>/dev/null)
+      [ -n "$_sa_usage" ] || continue
+      read -r _u_model _u_in _u_out _u_w5 _u_w1 _u_rd <<EOF
+$_sa_usage
+EOF
+      _label=""
+      [ -n "$_u_model" ] && _label=$(_abbrev_model_id "$_u_model")
+      if [ -z "$_label" ]; then
+        _type=$(printf '%s' "$_sa_typemap" | _run_jq -r --arg id "$_id" '.[$id] // "agent"' 2>/dev/null)
+        _label=$(_abbrev_type "$_type")
+      fi
+
+      read -r _p_in _p_out _p_w5 _p_w1 _p_rd <<EOF
+$(price_for_model "$_u_model" "")
+EOF
+      _cost=""
+      if [ -n "${_p_in:-}" ]; then
+        _cost=$(awk -v a="${_u_in:-0}" -v b="${_u_out:-0}" -v c="${_u_w5:-0}" -v d="${_u_w1:-0}" -v e="${_u_rd:-0}" \
+          -v pi="$_p_in" -v po="$_p_out" -v p5="$_p_w5" -v p1="$_p_w1" -v pr="$_p_rd" \
+          'BEGIN{ cost=(a*pi+b*po+c*p5+d*p1+e*pr)/1000000; printf "%.6f", cost }')
+      fi
+      [ -n "$_cost" ] && _sa_grouped="${_sa_grouped}${_label}\t${_cost}\n"
+    done <<EOF
+$_sa_ids
+EOF
+  fi
+
+  # Per-model breakdown, NOT a collapsed "top model's label + everyone's total"
+  # (that reads as "3 agents ran opus, $X" when only 1 of the 3 did — caught
+  # before shipping, not after: same top-2-by-share shape already used for the
+  # tool-usage segment below, applied here for the same reason).
+  if [ -n "$_sa_grouped" ]; then
+    _sa_line=$(printf '%b' "$_sa_grouped" | awk -F'\t' '
+      NF<2 {next}
+      { sum[$1]+=$2; cnt[$1]++; n++ }
+      END {
+        top1=""; top1sum=-1
+        for (k in sum) if (sum[k]>top1sum) { top1sum=sum[k]; top1=k }
+        top2=""; top2sum=-1
+        for (k in sum) if (k!=top1 && sum[k]>top2sum) { top2sum=sum[k]; top2=k }
+        if (top2sum<0) top2sum=0
+        printf "%d %s %d %.6f %s %d %.6f", n, top1, cnt[top1], top1sum, top2, (top2==""?0:cnt[top2]), top2sum
+      }')
+    # shellcheck disable=SC2086
+    set -- $_sa_line
+    sub_agent_count=${1:-0}
+    sub_agent_top=${2:-}
+    sub_agent_top_count=${3:-0}
+    sub_agent_top_cost=${4:-0}
+    sub_agent_top2=${5:-}
+    sub_agent_top2_count=${6:-0}
+    sub_agent_top2_cost=${7:-0}
+  fi
+fi
 
 # --- process counts: interactive sessions machine-wide ---
 # Portable: awk strips leading path so /usr/bin/claude and claude both match.
@@ -332,11 +474,6 @@ if [ -n "$session_id" ]; then
   fi
 fi
 
-_base_tok=$(( ${base_tok:-$tok_raw} + 0 ))
-delta_tok=$(( tok_raw - _base_tok ))
-[ "$delta_tok" -lt 0 ] && delta_tok=0
-# delta_top removed: misleads when top tool changes between turns
-
 # --- weekly pace ("smart %"): headroom vs calendar, in units of ONE day's budget ---
 # The weekly allowance spread evenly = 100/7 pp per day. By now you "should" have
 # spent elapsed_fraction * 100. Positive => under pace (budget in hand), negative =>
@@ -402,8 +539,6 @@ fi
 parts+=("${_header}${RST}")
 
 if [ "$tok_raw" -gt 0 ] 2>/dev/null; then
-  # always show delta so +0 is explicit (vs missing = ambiguous)
-  extra=" $(format_delta "$delta_tok")"
   # --- segment 1: context-window occupancy (size, not cost — cache tokens still
   # count against the window, so this must stay the gross total, unlabeled ctx% below
   # is derived from the SAME total the CLI reports as used_percentage) ---
@@ -411,9 +546,26 @@ if [ "$tok_raw" -gt 0 ] 2>/dev/null; then
   if [ -n "$used_pct" ]; then
     ctx_bang=""
     [ "$ctx_urgent" = "1" ] && ctx_bang="!"
-    ctx_part=$(awk -v p="$used_pct" -v b="$ctx_bang" 'BEGIN{printf " ctx:%s%.0f%%", b, p+0}')
+    ctx_part=$(awk -v p="$used_pct" -v b="$ctx_bang" 'BEGIN{printf "%s%.0f%%", b, p+0}')
   fi
-  tok_display="${YELLOW}↑${tok_in_str}/↓${tok_out_str}${RST}${DIM}(${extra# }${ctx_part})${RST}"
+  # sub-agent spend: real model family letter(s) — H/S/O, see sub_agent_top
+  # above — with real $ cost (cache-tier-exact, from the agent's own transcript,
+  # not the main segment's "assume 1h" approximation), falling back to a
+  # type-initial only if a sub-transcript was unreadable. Each label carries
+  # ITS OWN count×cost, not a top-model label stapled to everyone's combined
+  # total (that misreads as "all N agents ran this model" when a second model
+  # was mixed in). No "agents:" word-label. Sits in the slot that used to show
+  # the per-turn tok delta (+Δ), which carried no real signal turn-to-turn.
+  sa_part=""
+  if [ "${sub_agent_count:-0}" -gt 0 ] 2>/dev/null; then
+    _sa1_cost=$(awk -v c="${sub_agent_top_cost:-0}" 'BEGIN{printf "%.4f", c+0}')
+    sa_part="${sub_agent_top:-?}×${sub_agent_top_count:-0} \$${_sa1_cost}"
+    if [ -n "$sub_agent_top2" ] && [ "$(awk -v c="${sub_agent_top2_cost:-0}" 'BEGIN{print (c+0>0)?1:0}')" = "1" ]; then
+      _sa2_cost=$(awk -v c="${sub_agent_top2_cost:-0}" 'BEGIN{printf "%.4f", c+0}')
+      sa_part="${sa_part} ${sub_agent_top2}×${sub_agent_top2_count} \$${_sa2_cost}"
+    fi
+  fi
+  tok_display="${YELLOW}↑${tok_in_str}/↓${tok_out_str}${RST}${DIM}(${sa_part:+${sa_part} }${ctx_part})${RST}"
   parts+=("$tok_display")
 
   # --- segment 2: cache efficiency (cost-relevant — "did the prefix survive").
